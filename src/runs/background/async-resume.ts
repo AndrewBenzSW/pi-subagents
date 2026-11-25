@@ -1,23 +1,27 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { DIRS, type AcceptanceInput, type AsyncStatus, type SteeringRecoveryDescriptor, type SubagentRunMode } from "../../shared/types.ts";
+import { DIRS, RUNNER_LAUNCHER_NAME_PATTERN, type AcceptanceInput, type AsyncStatus, type SteeringRecoveryDescriptor, type SubagentRunMode } from "../../shared/types.ts";
 import type { AgentConfig } from "../../agents/agents.ts";
 import { normalizeExtensionBindings } from "../shared/extension-bindings.ts";
 import { snapshotRequiredChildExtensions } from "../../shared/required-child-extensions.ts";
 import { normalizeWorkflowLaneMetadata } from "../shared/lane-metadata.ts";
 import { validateAcceptanceInput } from "../shared/acceptance.ts";
 import { validateToolBudgetConfig } from "../shared/tool-budget.ts";
-import { intersectSubagentCapabilityCeilings, parseSubagentCapabilityCeiling, type ResolvedSubagentCapabilityCeiling } from "../shared/capability-ceiling.ts";
+import { intersectSubagentCapabilityCeilings, normalizeCapabilityCeilingAllowedAgents, parseSubagentCapabilityCeiling, type ResolvedSubagentCapabilityCeiling } from "../shared/capability-ceiling.ts";
 import { validateRunFanoutBudgetDescriptor } from "../shared/run-fanout-budget.ts";
+import { ownsRun } from "../shared/run-ownership.ts";
 import { reconcileAsyncRun } from "./stale-run-reconciler.ts";
 import { resultFilePath, resultPayloadPathForIndexedRun } from "./result-files.ts";
 import { canScanAsyncRunPrefix, MIN_SAFE_ASYNC_RUN_PREFIX_LENGTH } from "./run-id-query.ts";
 import { parallelHandoffPath, resolveRetainedWorktreeCwd } from "../shared/parallel-handoff.ts";
-import { normalizeWorktreeBaseRef } from "../shared/worktree.ts";
+import { findListedWorktreeAgentCwd, findListedWorktreeOnBranch, isComparablePathInside, normalizeWorktreeBaseRef } from "../shared/worktree.ts";
 import { intersectThinkingCeilings, parseThinkingLevel, type ThinkingLevel } from "../../shared/thinking-ceiling.ts";
 import { assertWorkflowGraphHostSteps } from "../shared/host-step-status.ts";
 import { validateIntercomBridgeConfig } from "../../intercom/intercom-bridge.ts";
 import { validateModelResponseAliases } from "../../shared/model-response-aliases.ts";
+import { readWorkflowLaunchRecord } from "../../workflows/workflow-launch-record.ts";
+import { recoveryDescriptorPath } from "../shared/run-launch-folder.ts";
+import { missingForkCopyNote } from "../../shared/artifacts.ts";
 
 export interface AsyncResumeParams {
 	id?: string;
@@ -77,6 +81,7 @@ interface AsyncResultFile {
 	thinking?: string;
 	launchContractDigest?: string;
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
+	admissionCapabilityCeiling?: ResolvedSubagentCapabilityCeiling;
 	results?: Array<{ agent?: string; sessionName?: string; success?: boolean; sessionFile?: string; intercomTarget?: string; model?: string; thinking?: string; launchContractDigest?: string; capabilityCeiling?: ResolvedSubagentCapabilityCeiling }>;
 }
 
@@ -140,6 +145,7 @@ function validateResultFile(value: unknown, resultPath: string): AsyncResultFile
 		thinking: validateOptionalString(data, "thinking", resultPath),
 		launchContractDigest: validateOptionalString(data, "launchContractDigest", resultPath),
 		...(data.capabilityCeiling === undefined ? {} : { capabilityCeiling: parseSubagentCapabilityCeiling(data.capabilityCeiling, `async result file '${resultPath}' capabilityCeiling`) }),
+		...(data.admissionCapabilityCeiling === undefined ? {} : { admissionCapabilityCeiling: parseSubagentCapabilityCeiling(data.admissionCapabilityCeiling, `async result file '${resultPath}' admissionCapabilityCeiling`) }),
 		...(typeof success === "boolean" ? { success } : {}),
 		...(results ? { results } : {}),
 	};
@@ -273,6 +279,7 @@ function validateStatusForResume(status: AsyncStatus | null, source: string): vo
 	if (status.cwd !== undefined && typeof status.cwd !== "string") throw new Error(`Invalid async status '${source}': cwd must be a string.`);
 	if (status.sessionFile !== undefined && typeof status.sessionFile !== "string") throw new Error(`Invalid async status '${source}': sessionFile must be a string.`);
 	if (status.capabilityCeiling !== undefined) status.capabilityCeiling = parseSubagentCapabilityCeiling(status.capabilityCeiling, `async status '${source}' capabilityCeiling`);
+	if (status.admissionCapabilityCeiling !== undefined) status.admissionCapabilityCeiling = parseSubagentCapabilityCeiling(status.admissionCapabilityCeiling, `async status '${source}' admissionCapabilityCeiling`);
 	if (status.steps !== undefined) {
 		if (!Array.isArray(status.steps)) throw new Error(`Invalid async status '${source}': steps must be an array.`);
 		status.steps.forEach((step, index) => {
@@ -282,6 +289,7 @@ function validateStatusForResume(status: AsyncStatus | null, source: string): vo
 			if (stepRecord.sessionFile !== undefined && typeof stepRecord.sessionFile !== "string") throw new Error(`Invalid async status '${source}': steps[${index}].sessionFile must be a string.`);
 			if (stepRecord.sessionName !== undefined && typeof stepRecord.sessionName !== "string") throw new Error(`Invalid async status '${source}': steps[${index}].sessionName must be a string.`);
 			if (stepRecord.model !== undefined && typeof stepRecord.model !== "string") throw new Error(`Invalid async status '${source}': steps[${index}].model must be a string.`);
+			if (stepRecord.launchModel !== undefined && typeof stepRecord.launchModel !== "string") throw new Error(`Invalid async status '${source}': steps[${index}].launchModel must be a string.`);
 			if (stepRecord.thinking !== undefined && typeof stepRecord.thinking !== "string") throw new Error(`Invalid async status '${source}': steps[${index}].thinking must be a string.`);
 			if (stepRecord.thinkingCeiling !== undefined) stepRecord.thinkingCeiling = parseThinkingLevel(stepRecord.thinkingCeiling, `async status '${source}' steps[${index}].thinkingCeiling`);
 			if (stepRecord.launchContractDigest !== undefined && typeof stepRecord.launchContractDigest !== "string") throw new Error(`Invalid async status '${source}': steps[${index}].launchContractDigest must be a string.`);
@@ -296,9 +304,10 @@ function normalizeRecoveryAcceptance(value: unknown, descriptorPath: string): Ac
 	return value as AcceptanceInput;
 }
 
-export function asyncReviveRequiresRecoveryDescriptor(target: Pick<AsyncResumeTarget, "recoveryDescriptor" | "mode" | "sessionFile">): boolean {
+/** A workflow-mode target has a ceiling only when its parent-owned launch record exists (resolveAsyncResumeTarget). */
+export function asyncReviveRequiresRecoveryDescriptor(target: Pick<AsyncResumeTarget, "recoveryDescriptor" | "mode" | "sessionFile" | "capabilityCeiling">): boolean {
 	if (target.recoveryDescriptor) return false;
-	return !(target.mode === "workflow" && Boolean(target.sessionFile));
+	return !(target.mode === "workflow" && target.sessionFile && target.capabilityCeiling);
 }
 
 function resumeTargetMode(status: AsyncStatus | null, result: AsyncResultFile | undefined): SubagentRunMode | undefined {
@@ -307,9 +316,8 @@ function resumeTargetMode(status: AsyncStatus | null, result: AsyncResultFile | 
 	return undefined;
 }
 
-export function readAsyncRecoveryDescriptor(asyncDir: string | undefined): SteeringRecoveryDescriptor | undefined {
-	if (!asyncDir) return undefined;
-	const descriptorPath = path.join(asyncDir, "recovery-descriptor.json");
+export function readAsyncRecoveryDescriptor(runsRoot: string, runId: string): SteeringRecoveryDescriptor | undefined {
+	const descriptorPath = recoveryDescriptorPath(runsRoot, runId);
 	if (!fs.existsSync(descriptorPath)) return undefined;
 	let value: unknown;
 	try {
@@ -320,11 +328,11 @@ export function readAsyncRecoveryDescriptor(asyncDir: string | undefined): Steer
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`Invalid async recovery descriptor '${descriptorPath}': expected an object.`);
 	const parsed = value as Record<string, unknown>;
 	const allowedFields = new Set([
-		"modelResponseAliases", "version", "launchContractDigest", "sourceRunId", "agentContract", "agent", "sessionFile", "cwd", "model", "modelProvider", "modelOverrideFromParent", "modelOrigin", "fallbackModels", "fast", "thinking", "thinkingCeiling", "tools", "allowNestedSubagents", "extensions",
+		"modelResponseAliases", "version", "launchContractDigest", "sourceRunId", "agentContract", "agent", "sessionFile", "cwd", "model", "modelProvider", "modelOverrideFromParent", "modelOrigin", "fast", "thinking", "thinkingCeiling", "tools", "allowNestedSubagents", "allowedAgents", "extensions",
 		"subagentOnlyExtensions", "mcpDirectTools", "excludeTools", "mutationTools", "systemPrompt", "systemPromptMode", "inheritProjectContext", "inheritGlobalContext", "inheritSkills", "skills",
-		"skillPath", "agentFilePath", "completionGuard", "memory", "outputPath", "outputMode", "structuredOutputSchema", "acceptance", "sessionDir", "artifactConfig",
+		"skillPath", "agentFilePath", "memory", "outputPath", "outputMode", "structuredOutputSchema", "acceptance", "sessionDir", "artifactConfig",
 		"artifactsDir", "maxOutput", "controlConfig", "context", "intercomBridge", "absoluteDeadlineAt", "initialTurnBudget", "initialToolBudget", "maxSubagentDepth", "share", "capabilityCeiling",
-		"launchResolvedExtensions", "runFanoutBudget", "lane", "baseRef",
+		"launchResolvedExtensions", "runFanoutBudget", "lane", "baseRef", "launcher", "requiredLauncher", "sessionId", "managedWorktree",
 		"extensionBindings",
 		"requiredExtensions",
 	]);
@@ -336,6 +344,15 @@ export function readAsyncRecoveryDescriptor(asyncDir: string | undefined): Steer
 		if (typeof parsed[field] !== "string" || !(parsed[field] as string).trim()) throw new Error(`Invalid async recovery descriptor '${descriptorPath}': ${field} must be a non-empty string.`);
 	}
 	if (parsed.version !== 1) throw new Error(`Invalid async recovery descriptor '${descriptorPath}': version must be 1.`);
+	if (parsed.launcher !== undefined && parsed.launcher !== null && (typeof parsed.launcher !== "string" || !RUNNER_LAUNCHER_NAME_PATTERN.test(parsed.launcher))) throw new Error(`Invalid async recovery descriptor '${descriptorPath}': launcher must be a launcher name or null.`);
+	if (parsed.requiredLauncher !== undefined) {
+		const required = parsed.requiredLauncher as Record<string, unknown> | null;
+		if (!required || typeof required !== "object" || Array.isArray(required) || Object.keys(required).some((key) => key !== "name" && key !== "definitionDigest")
+			|| typeof required.name !== "string" || !RUNNER_LAUNCHER_NAME_PATTERN.test(required.name)
+			|| typeof required.definitionDigest !== "string" || !/^[0-9a-f]{64}$/.test(required.definitionDigest)) {
+			throw new Error(`Invalid async recovery descriptor '${descriptorPath}': requiredLauncher must be { name, definitionDigest }.`);
+		}
+	}
 	try {
 		parsed.runFanoutBudget = validateRunFanoutBudgetDescriptor(parsed.runFanoutBudget);
 	} catch (error) {
@@ -368,13 +385,24 @@ export function readAsyncRecoveryDescriptor(asyncDir: string | undefined): Steer
 	if (parsed.inheritGlobalContext === undefined) parsed.inheritGlobalContext = parsed.inheritProjectContext;
 	else if (typeof parsed.inheritGlobalContext !== "boolean") throw new Error(`Invalid async recovery descriptor '${descriptorPath}': inheritGlobalContext must be a boolean.`);
 	if (parsed.allowNestedSubagents !== undefined && typeof parsed.allowNestedSubagents !== "boolean") throw new Error(`Invalid async recovery descriptor '${descriptorPath}': allowNestedSubagents must be a boolean.`);
+	if (parsed.allowedAgents !== undefined) {
+		try { parsed.allowedAgents = normalizeCapabilityCeilingAllowedAgents(parsed.allowedAgents); }
+		catch (error) { throw new Error(`Invalid async recovery descriptor '${descriptorPath}': ${error instanceof Error ? error.message : String(error)}`); }
+	}
 	if (!Number.isInteger(parsed.maxSubagentDepth) || (parsed.maxSubagentDepth as number) < 0) throw new Error(`Invalid async recovery descriptor '${descriptorPath}': maxSubagentDepth must be a non-negative integer.`);
-	for (const field of ["fallbackModels", "tools", "excludeTools", "extensions", "subagentOnlyExtensions", "mcpDirectTools", "mutationTools", "skills", "skillPath"] as const) {
+	for (const field of ["tools", "excludeTools", "extensions", "subagentOnlyExtensions", "mcpDirectTools", "mutationTools", "skills", "skillPath"] as const) {
 		const item = parsed[field];
 		if (item !== undefined && (!Array.isArray(item) || item.some((entry) => typeof entry !== "string" || !entry.trim()))) throw new Error(`Invalid async recovery descriptor '${descriptorPath}': ${field} must contain non-empty strings.`);
 	}
 	if (parsed.systemPrompt !== undefined && typeof parsed.systemPrompt !== "string") throw new Error(`Invalid async recovery descriptor '${descriptorPath}': systemPrompt must be a string.`);
-	for (const field of ["launchContractDigest", "sessionFile", "model", "modelProvider", "thinking", "agentFilePath", "outputPath", "sessionDir", "artifactsDir"] as const) {
+	if (parsed.managedWorktree !== undefined) {
+		const worktree = parsed.managedWorktree as Record<string, unknown> | null;
+		const valid = !!worktree && typeof worktree === "object" && !Array.isArray(worktree) && (
+			(worktree.provider === "native" && typeof worktree.cwd === "string" && path.isAbsolute(worktree.cwd) && Object.keys(worktree).length === 2)
+			|| (worktree.provider === "worktrunk" && typeof worktree.branch === "string" && !!worktree.branch.trim() && Object.keys(worktree).length === 2));
+		if (!valid) throw new Error(`Invalid async recovery descriptor '${descriptorPath}': managedWorktree is invalid.`);
+	}
+	for (const field of ["sessionId", "launchContractDigest", "sessionFile", "model", "modelProvider", "thinking", "agentFilePath", "outputPath", "sessionDir", "artifactsDir"] as const) {
 		if (parsed[field] !== undefined && (typeof parsed[field] !== "string" || !(parsed[field] as string).trim())) throw new Error(`Invalid async recovery descriptor '${descriptorPath}': ${field} must be a non-empty string.`);
 	}
 	if (parsed.baseRef !== undefined) {
@@ -385,7 +413,6 @@ export function readAsyncRecoveryDescriptor(asyncDir: string | undefined): Steer
 			throw new Error(`Invalid async recovery descriptor '${descriptorPath}': ${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
-	if (parsed.completionGuard !== undefined && typeof parsed.completionGuard !== "boolean") throw new Error(`Invalid async recovery descriptor '${descriptorPath}': completionGuard must be a boolean.`);
 	if (parsed.structuredOutputSchema !== undefined && (!parsed.structuredOutputSchema || typeof parsed.structuredOutputSchema !== "object" || Array.isArray(parsed.structuredOutputSchema))) throw new Error(`Invalid async recovery descriptor '${descriptorPath}': structuredOutputSchema must be an object.`);
 	if (parsed.memory !== undefined) {
 		if (!parsed.memory || typeof parsed.memory !== "object" || Array.isArray(parsed.memory)) throw new Error(`Invalid async recovery descriptor '${descriptorPath}': memory must be an object.`);
@@ -439,10 +466,32 @@ export function readAsyncRecoveryDescriptor(asyncDir: string | undefined): Steer
 	return parsed as unknown as SteeringRecoveryDescriptor;
 }
 
+/**
+ * handoff.json sits in the run directory, so its worktree cwd must be the one the launch chose: the
+ * native path the parent computed, or a worktree git itself lists on the requested Worktrunk branch.
+ */
+function assertLaunchedWorktreeCwd(runId: string, launchCwd: string, launched: NonNullable<SteeringRecoveryDescriptor["managedWorktree"]>, handoffCwd: string): string {
+	const listed = launched.provider === "native" ? undefined : findListedWorktreeOnBranch(launchCwd, launched.branch);
+	const matches = launched.provider === "native"
+		? isComparablePathInside(launched.cwd, handoffCwd) && isComparablePathInside(handoffCwd, launched.cwd)
+		: listed !== undefined && isComparablePathInside(listed, handoffCwd);
+	if (!matches) throw new Error(`Async run '${runId}' managed worktree ${handoffCwd} is not the worktree its launch created.`);
+	return handoffCwd;
+}
+
+/** A run launched in a worktree resumes in it, never in the source checkout, even when handoff.json is missing. */
+function launchedWorktreeCwdWithoutHandoff(runId: string, launchCwd: string, launched: NonNullable<SteeringRecoveryDescriptor["managedWorktree"]>): string {
+	const cwd = launched.provider === "native" ? launched.cwd : findListedWorktreeAgentCwd(launchCwd, launched.branch);
+	if (cwd === undefined || !fs.statSync(cwd, { throwIfNoEntry: false })?.isDirectory()) {
+		throw new Error(`Async run '${runId}' ran in a managed worktree (${launched.provider === "native" ? launched.cwd : `branch ${launched.branch}`}) that no longer exists; it cannot resume in the source checkout.`);
+	}
+	return cwd;
+}
+
 function validateResumeSessionFile(runId: string, sessionFile: string): string {
 	if (path.extname(sessionFile) !== ".jsonl") throw new Error(`Async run '${runId}' session file must be a .jsonl file: ${sessionFile}`);
 	const resolved = path.resolve(sessionFile);
-	if (!fs.existsSync(resolved)) throw new Error(`Async run '${runId}' session file does not exist: ${sessionFile}`);
+	if (!fs.existsSync(resolved)) throw new Error(`Async run '${runId}' session file does not exist: ${sessionFile}${missingForkCopyNote(resolved)}`);
 	return resolved;
 }
 
@@ -463,22 +512,39 @@ export function resolveAsyncResumeTarget(params: AsyncResumeParams, deps: AsyncR
 	const requireSessionFile = options.requireSessionFile ?? true;
 	const location = resolveAsyncRunLocation(params, asyncDirRoot, resultsDir);
 	if (!location.asyncDir && !location.resultPath) {
-		throw new Error("Async run not found. Provide id or dir.");
+		const requested = params.id ?? params.runId;
+		throw new Error(requested ? `Async run not found for '${requested}'.` : "Async run not found. Provide id or dir.");
 	}
 
+	// A run directory is always named for its run, so a status file naming another run is refused, and
+	// before reconciling: its repair publishes a result under the status file's run id.
+	if (location.asyncDir) {
+		let recordedRunId: unknown;
+		try { recordedRunId = (JSON.parse(fs.readFileSync(path.join(location.asyncDir, "status.json"), "utf-8")) as { runId?: unknown }).runId; } catch { /* missing or unreadable: validateStatusForResume reports it */ }
+		if (typeof recordedRunId === "string" && recordedRunId !== path.basename(location.asyncDir)) throw new Error(`Async run '${path.basename(location.asyncDir)}' has a status file for a different run '${recordedRunId}'.`);
+	}
 	const reconciliation = location.asyncDir
 		? reconcileAsyncRun(location.asyncDir, { resultsDir, kill: deps.kill, now: deps.now })
 		: undefined;
 	const status = reconciliation?.status ?? null;
 	validateStatusForResume(status, location.asyncDir ? path.join(location.asyncDir, "status.json") : "status.json");
-	const recoveryDescriptor = readAsyncRecoveryDescriptor(location.asyncDir ?? undefined);
+	// Records are trusted only for a run folder directly under the runs root: `dir` may name a
+	// runs-shaped tree a run built inside its own folder.
+	const directRunFolder = location.asyncDir !== null && path.dirname(location.asyncDir) === path.resolve(asyncDirRoot);
+	const recoveryDescriptor = directRunFolder ? readAsyncRecoveryDescriptor(asyncDirRoot, path.basename(location.asyncDir!)) : undefined;
 	const result = location.resultPath ? readResultFile(location.resultPath) : undefined;
-	const runId = status?.runId ?? result?.runId ?? result?.id ?? location.resolvedId ?? (location.asyncDir ? path.basename(location.asyncDir) : "unknown");
-	const mode = resumeTargetMode(status, result);
-	if (options.sessionId && ((status && status.sessionId !== options.sessionId) || (result && result.sessionId !== options.sessionId))) {
+	const runId = location.asyncDir ? path.basename(location.asyncDir) : result?.runId ?? result?.id ?? location.resolvedId ?? "unknown";
+	// Only a single run writes a recovery descriptor. When one exists, the run's identity (agent,
+	// session, cwd, model, ceilings) comes from it alone: status.json and the shared results directory
+	// are writable by a run behind a runner launcher.
+	const mode = recoveryDescriptor ? "single" : resumeTargetMode(status, result);
+	const notOwned = recoveryDescriptor
+		? !ownsRun(options.sessionId, recoveryDescriptor.sessionId)
+		: (status && !ownsRun(options.sessionId, status.sessionId)) || (result && !ownsRun(options.sessionId, result.sessionId));
+	if (options.sessionId && notOwned) {
 		throw new Error(`Async run '${runId}' was not found in the active session.`);
 	}
-	if (recoveryDescriptor && recoveryDescriptor.sourceRunId !== runId) throw new Error(`Async run '${runId}' has a recovery descriptor for a different source run.`);
+	if (recoveryDescriptor && recoveryDescriptor.sourceRunId !== runId) throw new Error(`Async run '${runId}' has a recovery descriptor for a different source run '${recoveryDescriptor.sourceRunId}'.`);
 	const state = status?.state ?? (result ? resultState(result) : undefined);
 	if (!state) throw new Error(`Status file not found for async run '${runId}'.`);
 	if (state === "stopped") throw new Error(`Async run '${runId}' was stopped and cannot be resumed. Start a new run instead.`);
@@ -495,18 +561,18 @@ export function resolveAsyncResumeTarget(params: AsyncResumeParams, deps: AsyncR
 			if (requestedIndex < 0 || requestedIndex >= stepCount) throw new Error(`Async run '${runId}' has ${stepCount} children. Index ${requestedIndex} is out of range.`);
 			const selectedStep = statusSteps[requestedIndex];
 			if (selectedStep?.status === "running") {
-				const capabilityCeiling = intersectSubagentCapabilityCeilings(status?.capabilityCeiling, selectedStep.capabilityCeiling);
+				const capabilityCeiling = recoveryDescriptor ? recoveryDescriptor.capabilityCeiling : intersectSubagentCapabilityCeilings(status?.capabilityCeiling, selectedStep.capabilityCeiling);
 				return {
 					kind: "live",
 					runId,
 					asyncDir: location.asyncDir ?? undefined,
 					state,
 					...(mode ? { mode } : {}),
-					agent: selectedStep.agent,
+					agent: recoveryDescriptor?.agent ?? selectedStep.agent,
 					...(selectedStep.sessionName ?? result?.results?.[requestedIndex]?.sessionName ? { sessionName: selectedStep.sessionName ?? result?.results?.[requestedIndex]?.sessionName } : {}),
 					index: requestedIndex,
 					cwd: status?.cwd ?? result?.cwd,
-					sessionFile: selectedStep.sessionFile ?? status?.sessionFile ?? result?.sessionFile,
+					sessionFile: recoveryDescriptor ? recoveryDescriptor.sessionFile : selectedStep.sessionFile ?? status?.sessionFile ?? result?.sessionFile,
 					model: selectedStep.model,
 					thinking: selectedStep.thinking,
 					launchContractDigest: selectedStep.launchContractDigest ?? result?.results?.[requestedIndex]?.launchContractDigest ?? result?.launchContractDigest ?? recoveryDescriptor?.launchContractDigest,
@@ -527,18 +593,18 @@ export function resolveAsyncResumeTarget(params: AsyncResumeParams, deps: AsyncR
 			if (!selected) {
 				throw new Error(`Async run '${runId}' has ${running.length} running children. Provide index to choose one.`);
 			}
-			const capabilityCeiling = intersectSubagentCapabilityCeilings(status?.capabilityCeiling, selected.step.capabilityCeiling);
+			const capabilityCeiling = recoveryDescriptor ? recoveryDescriptor.capabilityCeiling : intersectSubagentCapabilityCeilings(status?.capabilityCeiling, selected.step.capabilityCeiling);
 			return {
 				kind: "live",
 				runId,
 				asyncDir: location.asyncDir ?? undefined,
 				state,
 				...(mode ? { mode } : {}),
-				agent: selected.step.agent,
+				agent: recoveryDescriptor?.agent ?? selected.step.agent,
 				...(selected.step.sessionName ?? result?.results?.[selected.index]?.sessionName ? { sessionName: selected.step.sessionName ?? result?.results?.[selected.index]?.sessionName } : {}),
 				index: selected.index,
 				cwd: status?.cwd ?? result?.cwd,
-				sessionFile: selected.step.sessionFile ?? status?.sessionFile ?? result?.sessionFile,
+				sessionFile: recoveryDescriptor ? recoveryDescriptor.sessionFile : selected.step.sessionFile ?? status?.sessionFile ?? result?.sessionFile,
 				model: selected.step.model,
 				thinking: selected.step.thinking,
 				launchContractDigest: selected.step.launchContractDigest ?? result?.results?.[selected.index]?.launchContractDigest ?? result?.launchContractDigest ?? recoveryDescriptor?.launchContractDigest,
@@ -561,22 +627,39 @@ export function resolveAsyncResumeTarget(params: AsyncResumeParams, deps: AsyncR
 	if (selectedStatusStep?.status === "stopped" || selectedStatusStep?.stopped === true) {
 		throw new Error(`Async run '${runId}' child ${index} was stopped and cannot be resumed. Start a new run instead.`);
 	}
-	const agent = selectedStatusStep?.agent ?? resultSteps[index]?.agent ?? result?.agent;
+	const agent = recoveryDescriptor ? recoveryDescriptor.agent : selectedStatusStep?.agent ?? resultSteps[index]?.agent ?? result?.agent;
 	if (!agent) throw new Error(`Could not determine child agent for async run '${runId}'.`);
-	if (recoveryDescriptor && recoveryDescriptor.agent !== agent) throw new Error(`Async run '${runId}' has a recovery descriptor for '${recoveryDescriptor.agent}', not '${agent}'.`);
-	const sessionFile = statusSteps[index]?.sessionFile
-		?? resultSteps[index]?.sessionFile
-		?? (stepCount === 1 ? status?.sessionFile ?? result?.sessionFile : undefined);
+	const sessionFile = recoveryDescriptor
+		? recoveryDescriptor.sessionFile
+		: statusSteps[index]?.sessionFile
+			?? resultSteps[index]?.sessionFile
+			?? (stepCount === 1 ? status?.sessionFile ?? result?.sessionFile : undefined);
 	if (!sessionFile && requireSessionFile) throw new Error(`Async run '${runId}' child ${index} does not have a persisted session file to resume from.`);
 	const resolvedSessionFile = sessionFile ? validateResumeSessionFile(runId, sessionFile) : undefined;
-	const stepModel = statusSteps[index]?.model ?? resultSteps[index]?.model ?? (stepCount === 1 ? result?.model : undefined);
-	const stepThinking = statusSteps[index]?.thinking ?? resultSteps[index]?.thinking ?? (stepCount === 1 ? result?.thinking : undefined);
-	const thinkingCeiling = statusSteps[index]?.thinkingCeiling ?? (stepCount === 1 ? recoveryDescriptor?.thinkingCeiling : undefined);
-	const capabilityCeiling = intersectSubagentCapabilityCeilings(status?.capabilityCeiling, statusSteps[index]?.capabilityCeiling, result?.capabilityCeiling, resultSteps[index]?.capabilityCeiling);
-	const managedWorktreeCwd = location.asyncDir
-		? resolveRetainedWorktreeCwd(parallelHandoffPath(location.asyncDir), runId, index)
+	const stepModel = recoveryDescriptor ? recoveryDescriptor.model : statusSteps[index]?.launchModel ?? statusSteps[index]?.model ?? resultSteps[index]?.model ?? (stepCount === 1 ? result?.model : undefined);
+	const stepThinking = recoveryDescriptor ? recoveryDescriptor.thinking : statusSteps[index]?.thinking ?? resultSteps[index]?.thinking ?? (stepCount === 1 ? result?.thinking : undefined);
+	const thinkingCeiling = recoveryDescriptor ? recoveryDescriptor.thinkingCeiling : statusSteps[index]?.thinkingCeiling;
+	// A workflow's admission ceiling comes only from the parent-owned launch record of its run directory:
+	// a run behind a launcher can write its own status.json (including a directory nested in it) and the
+	// shared results directory. Without a record there is no ceiling, so a revive without a recovery
+	// descriptor is refused.
+	const workflowLaunch = mode === "workflow" && directRunFolder
+		? readWorkflowLaunchRecord(asyncDirRoot, runId)
 		: undefined;
-	const resumeCwd = validateResumeCwd(runId, managedWorktreeCwd ?? status?.cwd ?? result?.cwd ?? recoveryDescriptor?.cwd);
+	const capabilityCeiling = recoveryDescriptor
+		? recoveryDescriptor.capabilityCeiling
+		: mode === "workflow"
+		? (workflowLaunch?.ok ? workflowLaunch.record.admissionCapabilityCeiling : undefined)
+		: intersectSubagentCapabilityCeilings(status?.capabilityCeiling, statusSteps[index]?.capabilityCeiling, result?.capabilityCeiling, resultSteps[index]?.capabilityCeiling);
+	const handoffWorktreeCwd = location.asyncDir && (!recoveryDescriptor || recoveryDescriptor.managedWorktree)
+		? resolveRetainedWorktreeCwd(parallelHandoffPath(location.asyncDir), runId, index, statusSteps[index]?.worktreePath)
+		: undefined;
+	const managedWorktreeCwd = recoveryDescriptor?.managedWorktree
+		? handoffWorktreeCwd
+			? assertLaunchedWorktreeCwd(runId, recoveryDescriptor.cwd, recoveryDescriptor.managedWorktree, handoffWorktreeCwd)
+			: launchedWorktreeCwdWithoutHandoff(runId, recoveryDescriptor.cwd, recoveryDescriptor.managedWorktree)
+		: handoffWorktreeCwd;
+	const resumeCwd = validateResumeCwd(runId, managedWorktreeCwd ?? (recoveryDescriptor ? recoveryDescriptor.cwd : status?.cwd ?? result?.cwd));
 
 	return {
 		kind: "revive",
@@ -592,9 +675,10 @@ export function resolveAsyncResumeTarget(params: AsyncResumeParams, deps: AsyncR
 		...(resolvedSessionFile ? { sessionFile: resolvedSessionFile } : {}),
 		...(stepModel ? { model: stepModel } : {}),
 		...(stepThinking ? { thinking: stepThinking } : {}),
-		launchContractDigest: statusSteps[index]?.launchContractDigest ?? resultSteps[index]?.launchContractDigest ?? result?.launchContractDigest ?? recoveryDescriptor?.launchContractDigest,
-		...(statusSteps[index]?.runner ? { runner: statusSteps[index]!.runner } : {}),
-		...(statusSteps[index]?.externalJob ? { externalJob: statusSteps[index]!.externalJob } : {}),
+		launchContractDigest: recoveryDescriptor ? recoveryDescriptor.launchContractDigest : statusSteps[index]?.launchContractDigest ?? resultSteps[index]?.launchContractDigest ?? result?.launchContractDigest,
+		// External runners write no recovery descriptor.
+		...(!recoveryDescriptor && statusSteps[index]?.runner ? { runner: statusSteps[index]!.runner } : {}),
+		...(!recoveryDescriptor && statusSteps[index]?.externalJob ? { externalJob: statusSteps[index]!.externalJob } : {}),
 		...(capabilityCeiling ? { capabilityCeiling } : {}),
 		...(thinkingCeiling ? { thinkingCeiling } : {}),
 		...(recoveryDescriptor ? { recoveryDescriptor } : {}),
@@ -606,12 +690,12 @@ export function applySteeringRecoveryAgentConfig(agentConfig: AgentConfig, descr
 		...agentConfig,
 		model: descriptor.model,
 		modelProvider: descriptor.modelProvider,
-		fallbackModels: descriptor.fallbackModels ? [...descriptor.fallbackModels] : undefined,
 		thinking: descriptor.thinking,
 		maxThinking: intersectThinkingCeilings(descriptor.thinkingCeiling, agentConfig.maxThinking),
 		tools: descriptor.tools ? [...descriptor.tools] : undefined,
 		excludeTools: descriptor.excludeTools ? [...descriptor.excludeTools] : undefined,
 		allowNestedSubagents: descriptor.allowNestedSubagents,
+		allowedAgents: descriptor.allowedAgents === undefined ? undefined : [...descriptor.allowedAgents],
 		extensions: descriptor.extensions ? [...descriptor.extensions] : undefined,
 		subagentOnlyExtensions: descriptor.subagentOnlyExtensions ? [...descriptor.subagentOnlyExtensions] : undefined,
 		mcpDirectTools: descriptor.mcpDirectTools ? [...descriptor.mcpDirectTools] : undefined,
@@ -624,11 +708,13 @@ export function applySteeringRecoveryAgentConfig(agentConfig: AgentConfig, descr
 		skills: descriptor.skills ? [...descriptor.skills] : undefined,
 		skillPath: descriptor.skillPath ? [...descriptor.skillPath] : undefined,
 		filePath: descriptor.agentFilePath as string,
-		completionGuard: descriptor.completionGuard,
 		memory: descriptor.memory ? { ...descriptor.memory } : undefined,
 		output: descriptor.outputPath,
 		toolBudget: descriptor.initialToolBudget,
 		maxSubagentDepth: descriptor.maxSubagentDepth,
+		// A recorded launcher, or a recorded null (ran unwrapped), wins over the current agent file.
+		// A missing field says nothing, so the run never loses the agent file's launcher.
+		launcher: descriptor.launcher === undefined ? agentConfig.launcher : descriptor.launcher ?? undefined,
 	};
 }
 

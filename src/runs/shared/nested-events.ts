@@ -177,6 +177,11 @@ export function inheritedNestedParentAddressOf(runtime: { nestedParent?: { paren
 	};
 }
 
+/** The owner's reply when its foreground map has no route for a nested run; interrupt matches it exactly. */
+export function nestedRunNotActiveMessage(runId: string): string {
+	return `Nested run ${runId} is not active in this fanout child.`;
+}
+
 export function resolveNestedAsyncDir(rootRunId: string, run: NestedRunSummary): string | undefined {
 	if (!run.asyncDir) return undefined;
 	const resolved = path.resolve(run.asyncDir);
@@ -356,6 +361,7 @@ export function sanitizeSummary(input: unknown, depth = 0): NestedRunSummary | u
 		...(clampNumber(raw.pid) !== undefined && clampNumber(raw.pid)! > 0 && Number.isInteger(clampNumber(raw.pid)) ? { pid: clampNumber(raw.pid) } : {}),
 		...(stringValue(raw.sessionId, 256) ? { sessionId: stringValue(raw.sessionId, 256) } : {}),
 		...(stringValue(raw.sessionFile, 2048) ? { sessionFile: stringValue(raw.sessionFile, 2048) } : {}),
+		...(isSafeNestedId(raw.revivedFrom) ? { revivedFrom: raw.revivedFrom } : {}),
 		...(stringValue(raw.intercomTarget, 256) ? { intercomTarget: stringValue(raw.intercomTarget, 256) } : {}),
 		...(stringValue(raw.ownerIntercomTarget, 256) ? { ownerIntercomTarget: stringValue(raw.ownerIntercomTarget, 256) } : {}),
 		...(stringValue(raw.leafIntercomTarget, 256) ? { leafIntercomTarget: stringValue(raw.leafIntercomTarget, 256) } : {}),
@@ -613,12 +619,24 @@ export interface NestedRunMatch {
 	run: NestedRunSummary;
 }
 
+export function retainNestedLookupRoute(
+	state: Pick<SubagentState, "currentSessionId" | "retainedNestedLookupRoutes">,
+	route: NestedRouteInfo | undefined,
+	sessionId: string | undefined,
+): void {
+	if (!route || !sessionId || sessionId !== state.currentSessionId) return;
+	if (state.retainedNestedLookupRoutes?.sessionId !== sessionId) {
+		state.retainedNestedLookupRoutes = { sessionId, routes: new Map() };
+	}
+	state.retainedNestedLookupRoutes.routes.set(route.rootRunId, route);
+}
+
 export interface NestedRunResolutionScope {
 	routes: NestedRoute[];
 	descendantOf?: { parentRunId: string; parentStepIndex?: number };
 }
 
-function collectNestedRuns(children: NestedRunSummary[] | undefined, output: NestedRunSummary[] = []): NestedRunSummary[] {
+export function collectNestedRuns(children: NestedRunSummary[] | undefined, output: NestedRunSummary[] = []): NestedRunSummary[] {
 	for (const child of children ?? []) {
 		output.push(child);
 		collectNestedRuns(child.children, output);
@@ -997,6 +1015,7 @@ export function nestedSummaryFromAsyncStatus(status: AsyncStatus, asyncDir: stri
 		asyncDir,
 		...(status.pid ? { pid: status.pid } : {}),
 		...(status.sessionId ? { sessionId: status.sessionId } : {}),
+		...(status.revivedFrom ? { revivedFrom: status.revivedFrom } : {}),
 		mode: status.mode ?? fallback.mode,
 		...(status.steps?.length === 1 && status.steps[0]?.model ? { model: status.steps[0].model } : {}),
 		...(status.steps?.length === 1 && status.steps[0]?.thinking ? { thinking: status.steps[0].thinking } : {}),
@@ -1065,8 +1084,15 @@ export function isTopLevelAsyncDir(asyncDir: string): boolean {
 	return containedPath(DIRS.async, resolved) && !containedPath(path.join(TEMP_ROOT_DIR, "nested-subagent-runs"), resolved);
 }
 
-export function nestedResultsPath(rootRunId: string, id: string): string {
+export function nestedRunScope(rootRunId: string) {
 	assertSafeId("rootRunId", rootRunId);
+	return {
+		asyncDirRoot: path.join(TEMP_ROOT_DIR, "nested-subagent-runs", rootRunId),
+		resultsDir: path.join(DIRS.results, "nested", rootRunId),
+	};
+}
+
+export function nestedResultsPath(rootRunId: string, id: string): string {
 	assertSafeId("id", id);
-	return path.join(DIRS.results, "nested", rootRunId, `${id}.json`);
+	return path.join(nestedRunScope(rootRunId).resultsDir, `${id}.json`);
 }

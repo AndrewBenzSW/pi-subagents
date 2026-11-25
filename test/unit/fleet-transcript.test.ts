@@ -4,7 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import { visibleWidth, type MarkdownTheme } from "@earendil-works/pi-tui";
-import { readFleetTranscript, renderFleetTranscript } from "../../src/tui/fleet-transcript.ts";
+import { renderFleetTranscript } from "../../src/tui/fleet-transcript.ts";
+import { readFleetTranscript } from "../../src/shared/fleet-transcript-reader.ts";
 
 const theme = {
 	fg: (_name: string, text: string) => text,
@@ -85,6 +86,26 @@ describe("Fleet inspector structured transcript", () => {
 		}
 	});
 
+	it("qualifies the assistant model line with the provider carried on the record", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fleet-transcript-model-provider-"));
+		try {
+			const transcriptPath = writeTranscript(root, [
+				{ recordType: "message", role: "assistant", model: "claude-haiku-4-5", text: "qualified", message: { role: "assistant", provider: "anthropic", model: "claude-haiku-4-5" }, ts: 1 },
+				{ recordType: "message", role: "assistant", model: "gpt-5-mini", text: "unqualified", ts: 2 },
+				{ recordType: "message", role: "assistant", model: "openrouter/auto-beta", text: "provider-local id with a slash", message: { role: "assistant", provider: "openrouter", model: "openrouter/auto-beta" }, ts: 3 },
+			]);
+			const transcript = readFleetTranscript(transcriptPath, { trustedRoots: [root] });
+			const assistantEvents = transcript.events.filter((event) => event.kind === "assistant");
+			assert.equal(assistantEvents[0]?.model, "anthropic/claude-haiku-4-5");
+			assert.equal(assistantEvents[1]?.model, "gpt-5-mini");
+			assert.equal(assistantEvents[2]?.model, "openrouter/openrouter/auto-beta");
+			const rendered = renderFleetTranscript(transcript, 60, theme as never, markdownTheme);
+			assert.ok(rendered.some((line) => line.includes("Assistant") && line.includes("anthropic/claude-haiku-4-5")));
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("renders compact bash output and expanded read/bash-style tool results", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fleet-tool-render-"));
 		try {
@@ -109,6 +130,29 @@ describe("Fleet inspector structured transcript", () => {
 			assert.ok(expanded.some((line) => line.includes("read src/a.ts")));
 			assert.ok(expanded.some((line) => line.includes("const answer: number = 42;")));
 			assert.ok(expanded.some((line) => line.includes("x to collapse")));
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("shows a running bash tool's full multiline command when tools are expanded", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fleet-bash-args-"));
+		try {
+			const command = "python3 - <<'PY'\nfrom pathlib import Path\nimport json\nprint(json.dumps({'cwd': str(Path('.').resolve()), 'note': 'a long line that has to wrap'}))\nPY";
+			const truncatedPayload = `${JSON.stringify({ command: "cat <<'EOF'\nhuge" }, null, 2).slice(0, 20)}\n\n… payload truncated`;
+			const transcriptPath = writeTranscript(root, [
+				{ recordType: "tool_start", toolName: "bash", argsPreview: "python3 - <<'PY' from pathlib import Path import json...", argsPayload: JSON.stringify({ command }, null, 2), ts: 1000 },
+				{ recordType: "tool_start", toolName: "bash", argsPreview: "cat <<'EOF' huge...", argsPayload: truncatedPayload, ts: 1100 },
+			]);
+			const transcript = readFleetTranscript(transcriptPath, { trustedRoots: [root] });
+			const compact = renderFleetTranscript(transcript, 40, theme as never, markdownTheme).join("\n");
+			assert.ok(!compact.includes("print(json.dumps"));
+
+			const expanded = renderFleetTranscript(transcript, 40, theme as never, markdownTheme, { expandedTools: true });
+			assert.ok(expanded.every((line) => visibleWidth(line) <= 40));
+			const text = expanded.join("\n");
+			for (const fragment of ["$ python3 - <<'PY'", "from pathlib import Path", "import json", "has to wrap", "PY"]) assert.ok(text.includes(fragment), fragment);
+			assert.ok(text.includes("payload truncated"));
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}

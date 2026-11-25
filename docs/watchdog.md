@@ -46,13 +46,15 @@ you ─▶ agent turn ─▶ edits repo ─▶ agent_end ─▶ watchdog review
                                              └─ warning: low/medium user entry, or high steered message
 ```
 
-Collapsed warnings show the title and evidence line. Expanded warnings show evidence, recommended action, importance, category, and source:
+A warning shows as one `[subagent] watchdog concern` or `[subagent] watchdog blocker` line, like every other message pi-subagents shows in the chat. Pi's expand key, or a click on the line, opens it to the summary, evidence, recommended action, importance, category, and source:
 
 ```
-● Subagent watchdog Blocker (displayed): Claims tests passed without running them
-  Evidence: The transcript claims `npm test` passed but no test command appears in the tool log.
-  Recommended action: Run the focused test before finishing.
-  Importance: High · Category: Test Gap · Source: main
+[subagent] watchdog blocker
+
+Subagent watchdog Blocker (displayed): Claims tests passed without running them
+Evidence: The transcript claims npm test passed but no test command appears in the tool log.
+Recommended action: Run the focused test before finishing.
+Importance: High · Category: Test Gap · Source: main
 ```
 
 When consecutive boundary reviews raise the same warning, the agent is not making progress. After `stalemateRepeats` identical warnings in a row (default 3), the warning is shown as `stalemate`, no continuation is triggered, and the turn ends. Your next prompt resets the count.
@@ -67,8 +69,9 @@ Child watchdog findings are lifted into the parent in three ways:
 
 ## What the reviewer is given
 
-- **Turn delta** with changed repo paths. Over-long input keeps the first 6,000 characters and the tail.
-- **Current scope** (`scope.enabled`, default on): bounded real user prompts. Side questions are additive; only explicit changes supersede older requirements.
+- **Turn delta** with changed repo paths. Over-long input keeps up to the first 6,000 characters and the tail. Whenever any of the run's turn text was left out to fit (whole turns dropped, or one long turn or the delta cut), the delta starts with a note saying how much, and the reviewer is told not to report an instruction as missing when it may be in an omitted part.
+- **Current scope** (`scope.enabled`, default on): bounded real user prompts. Side questions are additive; only explicit changes supersede older requirements. Scope survives compaction within the current session.
+- **Supervisor replies** (with scope, child watchdogs): paired `contact_supervisor` decision and interview requests with their non-error replies, kept outside the turn delta so a long run cannot drop them. Each entry is bounded to 3,000 characters, with a 6,000-character recent tail kept for the session like scope.
 - **`watchdog_diff`** when inside git: diff since the session-start commit, including later commits, plus untracked paths to inspect with `read`; accepts `path` and `stat:true`.
 - **`WATCHDOG.md`** standing instructions, read fresh on every review: `<project>/.pi/WATCHDOG.md` first, then `~/.pi/agent/WATCHDOG.md`, capped at 8,000 characters. Set `guidance.watchdogMd: false` to ignore them.
 - **LSP diagnostics** from `typescript-language-server`, auto-detected in `node_modules/.bin` or `PATH`; it is never installed and never run over the whole workspace. Errors become blockers, warnings concerns, and info/hints stay in status.
@@ -108,21 +111,19 @@ When a main watchdog model is configured (including a session override), recomme
 
 Omit `main.model` to inherit the session model and thinking level. A `main.model` without a thinking suffix or `main.thinking` runs with thinking off, so prefer `:high` for the strong pairing.
 
-Set `fallbackModels` in JSON settings on `main`, `children`, or `children.overrides.<agent>` to opt into an ordered fallback chain, for example `"fallbackModels": ["openai-codex/gpt-5.5:high"]`. Child overrides win over `children.fallbackModels`; neither inherits the main watchdog's chain. Arrays replace across user → project → session settings, and `[]` clears an inherited chain. Status shows configured chains.
+The watchdog resolves one reviewer model and makes one review call. Unavailable models fail visibly; rate limits, quota, authentication, provider timeouts, findings, clarification, cancellation, and the overall watchdog deadline never switch models automatically. An inherited model keeps the current session model and thinking level.
 
-Unavailable configured candidates are skipped and resolved duplicates are tried once. Each attempt uses a fresh reviewer with its own model auth, provider stream, and thinking; an inherited primary keeps the actual session model/thinking, while fallbacks use explicit-model thinking rules. Fallback follows normal subagent provider-failure semantics (including rate limits, quota, auth, unavailability, and provider timeouts), **only before any tool work**, including read-only inspection. Clean/normal completion, length limits, findings, clarification, cancellation, and the overall watchdog deadline never trigger fallback. All attempts share the original deadline; exhaustion remains a failed review. With no fallback chain, existing single-model behavior is unchanged.
-
-Agents can call `subagent({ action: "watchdog.recommend-model" })` and `subagent({ action: "watchdog.configure", model: "recommended", scope: "session" | "user" | "project" })`. They should use `scope: "session"` unless you ask for a lasting default.
+Agents can call `subagent({ action: "watchdog.recommend-model" })` and `subagent({ action: "watchdog.configure", model: "recommended", options: { scope: "session" | "user" | "project" } })`. They should use `options: { scope: "session" }` unless you ask for a lasting default.
 
 ## Optional main-session clarification
 
 Use `watchdog_warn` directly for evidence-backed reminders of forgotten authorized work; a question is not a prerequisite. Distinguish forgotten work from dependencies still pending or explicit holds. Use clarification when task status or intent is genuinely unclear. The orchestrator remains owner of its task/lane board.
 
-With this opt-in, completed `turn_end` events retain a recent actual-activity tail: paired calls/results for `subagent` dispatch (no action), `subagent` actions `status`, `resume`, `interrupt`, `steer`, `stop`, `bg_wait`, and `subagent_supervisor` actions `pending`, `list`, `reply`. Pairing requires the same tool name and exact tool-call ID; raw results, unrelated tool names and watchdog management actions do not qualify. Each activity entry is bounded to 3,000 characters, with a 6,000-character recent tail retained across ordinary new prompts and skipped edit boundaries. Session replacement, compaction, shutdown or disabling clears it. This is observed text, not an inferred task board.
+With this opt-in, completed `turn_end` events retain a recent actual-activity tail: paired calls/results for `subagent` dispatch (no action) and `subagent` actions `status`, `resume`, `interrupt`, `steer`, `stop`, `wait`, and `reply`. Pairing requires the same tool name and exact tool-call ID; raw results, unrelated tool names and watchdog management actions do not qualify. Each activity entry is bounded to 3,000 characters, with a 6,000-character recent tail retained across ordinary new prompts and skipped edit boundaries. Session replacement, compaction, shutdown or disabling clears it. This is observed text, not an inferred task board.
 
 New unreviewed activity permits at most one additional boundary review per user prompt even with no local edit. Side questions keep earlier authorized task evidence available; they do not themselves trigger a model call. Activity gathered after that prompt's extra review remains available for the next prompt. Warning continuations cannot supply fresh triggering activity. No polling, task scheduling, cross-worktree scans or idle calls are added.
 
-**Visibility limit:** external task/gate completions are visible when returned through those parent tool results. Standalone native completion notifications, arbitrary custom messages, direct shell/CI output, and events not delivered to the parent through these contracts are not ingested by this activity tail. Existing scope retains at most eight prompts (2,000 characters each); new streaming user input cancels an active review but is not added to scope unless `before_agent_start` fires. Reminders depend on retained evidence and model judgment, not an exhaustive view of running work.
+**Visibility limit:** external task/gate completions are visible when returned through those parent tool results. Standalone native completion notifications, arbitrary custom messages, direct shell/CI output, and events not delivered to the parent through these contracts are not ingested by this activity tail. Existing scope retains at most eight prompts (2,000 characters each); new streaming user input cancels an active review and is added to scope. Reminders depend on retained evidence and model judgment, not an exhaustive view of running work.
 
 Set `subagents.watchdog.clarification: true` in Pi settings alongside `enabled: true`. It defaults to `false` and applies **only to the main watchdog**, not child watchdogs or child permission arbitration.
 
@@ -140,7 +141,7 @@ Reviews retain the existing `agentEndTimeoutMs`. Questions and evidence are capp
 
 ## Child watchdogs
 
-Opt in under `subagents.watchdog.children`. `model`, `fallbackModels`, and `thinking` set the default child watchdog; `overrides.<agent>` can set `model`, `fallbackModels`, `thinking`, `enabled`, or `cadence` per role.
+Opt in under `subagents.watchdog.children`. `model` and `thinking` set the default child watchdog; `overrides.<agent>` can set `model`, `thinking`, `enabled`, or `cadence` per role.
 
 ## Launch rules
 
@@ -183,3 +184,5 @@ Values are `allow`, `ask`, and `deny`. Agent rules override global ones, omitted
 `ask` pauses that exact tool call and sends a bounded, redacted preview to a one-call arbiter owned by the child watchdog, using the configured child-watchdog model. The arbiter returns only `approve` or `deny` and does not notify the parent. A disabled watchdog, missing model/auth, timeout, malformed response, or runtime error denies the call with a clear error. Requests and decisions are written to bounded audit JSONL. `contact_supervisor` and the optional `pi-intercom` extension are never permission-gated.
 
 Bash is always passed through; bash rules are rejected. Use `pi-guard` for command-level policy. Children are pi sessions inside the parent process (foreground) or the detached runner process (background), not separate `pi` binaries, so there is no per-child command wrapper; load `pi-guard` into a child through the agent's `extensions` or `subagentOnlyExtensions`, and background children also pick it up as an ambient extension. External CLI profiles are opaque processes, so native permissions cannot intercept their tools; launches with effective `ask` or `deny` rules are rejected for external CLI agents.
+
+Detached runners receive `PI_SUBAGENT_PARENT_SESSION` from their exact launch and retain it for that dedicated process. Root and in-process foreground hosts do not publish a global parent identity because multiple Pi sessions can share a host. Environment-only permission extensions therefore cannot safely forward foreground `ask` requests; that path remains unsupported until the extension accepts a session-scoped target. Native child permissions are unaffected.

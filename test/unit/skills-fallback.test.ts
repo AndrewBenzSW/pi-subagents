@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -304,6 +304,21 @@ describe("skills filesystem fallback", () => {
 		assert.equal(resolved[0]?.source, "project-package");
 	});
 
+	it("skips settings package entries that name a single extension file", () => {
+		fs.mkdirSync(path.join(tempDir, ".pi", "extensions"), { recursive: true });
+		fs.writeFileSync(path.join(tempDir, ".pi", "extensions", "my-extension.ts"), "export default () => {};\n", "utf-8");
+		fs.writeFileSync(
+			path.join(tempDir, ".pi", "settings.json"),
+			JSON.stringify({ packages: ["./extensions/my-extension.ts"] }, null, 2),
+			"utf-8",
+		);
+		makeProjectSkill(tempDir, "project-skill", "Project skill.");
+
+		const { resolved, missing } = resolveSkills(["project-skill"], tempDir);
+		assert.deepEqual(missing, []);
+		assert.equal(resolved.length, 1);
+	});
+
 	it("discovers skills from project settings npm package sources", () => {
 		const packageRoot = path.join(tempDir, ".pi", "npm", "node_modules", "@scope", "skill-package");
 		makePackageSkill(
@@ -385,6 +400,39 @@ describe("skills filesystem fallback", () => {
 			},
 		);
 		assert.deepEqual(fs.readFileSync(marker, "utf-8").trim().split(/\r?\n/), ["npm-root-called", "npm-root-called"]);
+	});
+
+	it("keeps optional global discovery silent when no package manager is available", () => {
+		const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+		const emptyBinDir = path.join(tempDir, "empty-bin");
+		fs.mkdirSync(emptyBinDir, { recursive: true });
+
+		const script = `
+			const [{ discoverAvailableSkills }, { discoverAgents }] = await Promise.all([
+				import("./src/agents/skills.ts"),
+				import("./src/agents/agents.ts"),
+			]);
+			discoverAvailableSkills(process.cwd());
+			discoverAgents(process.cwd(), "both");
+		`;
+		const result = spawnSync(process.execPath, [
+			"--experimental-strip-types",
+			"--import",
+			"./test/support/isolated-temp-root.mjs",
+			"--input-type=module",
+			"--eval",
+			script,
+		], {
+			cwd: projectRoot,
+			env: {
+				...process.env,
+				PATH: emptyBinDir,
+				PI_OFFLINE: "",
+			},
+			encoding: "utf-8",
+		});
+		assert.equal(result.status, 0, result.stderr);
+		assert.equal(result.stderr, "", `optional global discovery leaked stderr: ${result.stderr}`);
 	});
 
 	it("uses the Windows APPDATA npm root without invoking npm", async () => {

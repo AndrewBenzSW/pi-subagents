@@ -10,6 +10,7 @@ import {
 	processTerminalPath,
 	readProcessTerminal,
 	sanitizeProcessTerminal,
+	unobservedRunnerExitPath,
 	writeProcessTerminalCandidate,
 } from "../../src/runs/background/process-terminal.ts";
 
@@ -272,7 +273,42 @@ test("process-terminal reports unknown when the runner candidate is unavailable"
 			runId: "run-2",
 			runnerProcessInstanceId: "runner-2",
 			reason: "runner-candidate-missing",
+			instances: [{ kind: "runner", processInstanceId: "runner-2", closeObservedAt: 40, exitCode: 1, signal: null }],
 		});
+	} finally {
+		fs.rmSync(asyncDir, { recursive: true, force: true });
+	}
+});
+
+test("process-terminal adds the observed runner exit to a sticky runner-published unknown proof", () => {
+	const asyncDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-process-terminal-"));
+	try {
+		const sticky = { version: 1, state: "unknown", runId: "run-3", runnerProcessInstanceId: "runner-3", reason: "process-tree-unverified", diagnostic: "Worktree setup settlement unknown" };
+		fs.writeFileSync(path.join(asyncDir, "process-terminal.json"), JSON.stringify(sticky));
+		const exit = { processInstanceId: "runner-3", closeObservedAt: 50, exitCode: null, signal: "SIGKILL" };
+		const expected = { ...sticky, instances: [{ kind: "runner", ...exit }] };
+
+		assert.deepEqual(finalizeProcessTerminal(asyncDir, "run-3", exit), expected);
+		assert.deepEqual(readProcessTerminal(asyncDir, { runId: "run-3", runnerProcessInstanceId: "runner-3" }), expected);
+	} finally {
+		fs.rmSync(asyncDir, { recursive: true, force: true });
+	}
+});
+
+test("process-terminal shows an unobserved runner exit only for the pending proof's own runner", () => {
+	const asyncDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-process-terminal-"));
+	try {
+		initializeProcessTerminal(asyncDir, "run-4", "runner-4");
+		const unobserved = (runnerProcessInstanceId: string) => fs.writeFileSync(unobservedRunnerExitPath(asyncDir), JSON.stringify({ version: 1, state: "unknown", runId: "run-4", runnerProcessInstanceId, reason: "observer-unavailable" }));
+
+		unobserved("runner-earlier");
+		assert.equal(readProcessTerminal(asyncDir)?.state, "pending");
+
+		unobserved("runner-4");
+		assert.equal(readProcessTerminal(asyncDir)?.reason, "observer-unavailable");
+
+		fs.writeFileSync(unobservedRunnerExitPath(asyncDir), "{");
+		assert.equal(readProcessTerminal(asyncDir)?.reason, "proof-write-failed");
 	} finally {
 		fs.rmSync(asyncDir, { recursive: true, force: true });
 	}

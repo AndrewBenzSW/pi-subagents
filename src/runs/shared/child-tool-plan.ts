@@ -9,6 +9,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
+	formatUnresolvedBuiltinMcpSelectors,
 	formatUnresolvedMcpDirectToolSelectors,
 	resolveMcpDirectToolResolution,
 	type McpRuntimeSnapshotHost,
@@ -21,6 +22,7 @@ import {
 } from "../../shared/types.ts";
 import { THINKING_LEVELS } from "../../shared/model-info.ts";
 import { getAgentDir } from "../../shared/utils.ts";
+import { resolveRuntimeModulePath, RUNTIME_MODULE_EXTENSIONS } from "../../shared/runtime-module-path.ts";
 import type { PermissionRules } from "./permissions.ts";
 import { snapshotRequiredChildExtensions, type RequiredChildExtensionSnapshot } from "../../shared/required-child-extensions.ts";
 import {
@@ -32,70 +34,22 @@ import {
 } from "./capability-ceiling.ts";
 
 const MAX_LAUNCH_RESOLVED_EXTENSION_IDS = 32;
-const PROMPT_RUNTIME_EXTENSION_PATH = path.join(
-	path.dirname(fileURLToPath(import.meta.url)),
-	`subagent-prompt-runtime${path.extname(fileURLToPath(import.meta.url))}`,
-);
-const FANOUT_CHILD_EXTENSION_PATH = path.join(
-	path.dirname(fileURLToPath(import.meta.url)),
-	"..",
-	"..",
-	"extension",
-	`fanout-child${path.extname(fileURLToPath(import.meta.url))}`,
-);
-const FAST_MODE_EXTENSION_PATH = path.join(
-	path.dirname(fileURLToPath(import.meta.url)),
-	`fast-mode-extension${path.extname(fileURLToPath(import.meta.url))}`,
-);
+const RUNTIME_EXTENSION_DIR = path.dirname(fileURLToPath(import.meta.url));
+const FANOUT_CHILD_EXTENSION_DIR = path.join(RUNTIME_EXTENSION_DIR, "..", "..", "extension");
+
 const SUBAGENT_RUNTIME_EXTENSION_PATHS = new Set([
-	PROMPT_RUNTIME_EXTENSION_PATH,
-	FANOUT_CHILD_EXTENSION_PATH,
-	FAST_MODE_EXTENSION_PATH,
-].map((extensionPath) => path.normalize(extensionPath)));
+	path.join(RUNTIME_EXTENSION_DIR, "subagent-prompt-runtime"),
+	path.join(RUNTIME_EXTENSION_DIR, "fast-mode-extension"),
+	path.join(FANOUT_CHILD_EXTENSION_DIR, "fanout-child"),
+].flatMap((base) => RUNTIME_MODULE_EXTENSIONS.map((extension) => path.normalize(`${base}${extension}`))));
 
 /** True for the extension files pi-subagents itself installs in child sessions. */
 export function isSubagentRuntimeExtensionPath(extensionPath: string): boolean {
 	return SUBAGENT_RUNTIME_EXTENSION_PATHS.has(path.normalize(extensionPath));
 }
-const FAST_MODE_ALLOWED_MODELS = new Set([
-	"openai-codex/gpt-5.6-luna",
-	"openai-codex/gpt-5.6-sol",
-]);
+// Priority tier is an OpenAI-Codex request field; other providers reject or ignore it.
+const FAST_MODE_PROVIDER_PREFIX = "openai-codex/";
 const OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH = 64;
-const PI_BUILTIN_TOOL_NAMES = new Set(["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"]);
-const REPOSITORY_INSPECTION_TOOLS = new Set(["read", "grep", "find", "ls", "bash", "powershell"]);
-const REVIEW_OR_SCOUT_AGENT_PATTERN = /\b(?:reviewer|scout)\b/i;
-
-export function isReviewOrScoutLaneAgent(agentName: string | undefined): boolean {
-	return typeof agentName === "string" && REVIEW_OR_SCOUT_AGENT_PATTERN.test(agentName);
-}
-
-export function missingPermittedRepositoryInspectionTools(
-	unavailableHostBuiltins: readonly string[],
-	excludeTools: readonly string[] = [],
-): string[] {
-	const excluded = new Set(excludeTools);
-	return unavailableHostBuiltins.filter((tool) => REPOSITORY_INSPECTION_TOOLS.has(tool) && !excluded.has(tool));
-}
-
-export function formatReviewLaneToolContractFailure(input: {
-	agentName?: string;
-	missingTools: readonly string[];
-	requestedTools?: readonly string[];
-	effectiveTools: readonly string[];
-	ceilingSources?: readonly string[];
-	excludeTools?: readonly string[];
-}): string {
-	const subject = input.agentName ? `Agent '${input.agentName}'` : "Subagent";
-	return [
-		`${subject}: tool contract could not be satisfied; host runtime does not provide permitted required repository tools [${input.missingTools.join(", ")}].`,
-		`Requested tool names: ${input.requestedTools ? `[${input.requestedTools.join(", ")}]` : "not explicitly specified"}; effective tool allowlist: [${input.effectiveTools.join(", ")}].`,
-		...(input.ceilingSources?.length ? [`Active capability ceiling sources: [${input.ceilingSources.join(", ")}].`] : []),
-		...(input.excludeTools?.length ? [`Explicit excludeTools: [${input.excludeTools.join(", ")}].`] : []),
-		"This is a lane infrastructure failure, not a completed review/scout result.",
-	].join(" ");
-}
-
 export function deriveForkPromptCacheKey(parentSessionId: string | undefined): string | undefined {
 	const parent = parentSessionId?.trim();
 	if (!parent) return undefined;
@@ -148,18 +102,18 @@ function stripThinkingSuffix(model: string): string {
 		: model;
 }
 
-function resolveFastModeExtension(input: Pick<ResolvePiLaunchToolPlanInput, "fast" | "model" | "modelCandidates" | "agentName">): string[] {
+function resolveFastModeExtension(input: Pick<ResolvePiLaunchToolPlanInput, "fast" | "model" | "agentName">): string[] {
 	if (!input.fast) return [];
-	const candidates = (input.modelCandidates?.length ? input.modelCandidates : input.model ? [input.model] : [])
+	const candidates = (input.model ? [input.model] : [])
 		.map(stripThinkingSuffix);
 	if (candidates.length === 0) {
 		throw new Error(`fast mode requires an explicit supported native OpenAI-Codex model${input.agentName ? ` for agent '${input.agentName}'` : ""}.`);
 	}
-	const unsupported = candidates.filter((model) => !FAST_MODE_ALLOWED_MODELS.has(model));
+	const unsupported = candidates.filter((model) => !model.startsWith(FAST_MODE_PROVIDER_PREFIX));
 	if (unsupported.length > 0) {
-		throw new Error(`fast mode supports only ${[...FAST_MODE_ALLOWED_MODELS].join(", ")}; unsupported model${unsupported.length === 1 ? "" : "s"}: ${unsupported.join(", ")}.`);
+		throw new Error(`fast mode supports only native ${FAST_MODE_PROVIDER_PREFIX}* models; unsupported model${unsupported.length === 1 ? "" : "s"}: ${unsupported.join(", ")}.`);
 	}
-	return [FAST_MODE_EXTENSION_PATH];
+	return [resolveRuntimeModulePath(RUNTIME_EXTENSION_DIR, "fast-mode-extension")];
 }
 
 export interface ResolvePiLaunchToolPlanInput {
@@ -181,22 +135,13 @@ export interface ResolvePiLaunchToolPlanInput {
 		  };
 	fast?: boolean;
 	model?: string;
-	modelCandidates?: readonly string[];
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
 	inheritedCapabilityCeiling?: ResolvedSubagentCapabilityCeiling;
 	agentName?: string;
 	permissionRules?: PermissionRules;
 	runtimeSnapshotHost?: McpRuntimeSnapshotHost;
-	/**
-	 * When provided, child tool plans intersect known Pi core tool slots with
-	 * this set. Core tools the agent declares but the host does not provide are
-	 * omitted with a non-fatal warning (tracked in `unavailableHostBuiltins`).
-	 * Review/scout lanes fail closed when a requested, still-permitted
-	 * repository inspection tool is among those host omissions. Intentionally
-	 * empty or ceiling-restricted allowlists are not a minimum-tool contract.
-	 * Non-core names remain allowed and are validated in the child's registry.
-	 */
-	hostAvailableBuiltins?: readonly string[];
+	/** The parent's built-in MCP selections; the background runner has no host to resolve selectors against. */
+	builtinMcpTools?: ResolvedMcpDirectToolSelection[];
 }
 
 export interface PiLaunchToolPlan {
@@ -208,6 +153,8 @@ export interface PiLaunchToolPlan {
 	resolvedMcpSelections: ResolvedMcpDirectToolSelection[];
 	effectiveMcpSelections: ResolvedMcpDirectToolSelection[];
 	effectiveMcpTools: string[];
+	/** Effective selections granted from Pi's built-in MCP; undefined when the selectors did not resolve against it. */
+	builtinMcpTools?: ResolvedMcpDirectToolSelection[];
 	explicitToolAllowlist: boolean;
 	internalTools: string[];
 	effectiveToolAllowlist: string[];
@@ -221,8 +168,6 @@ export interface PiLaunchToolPlan {
 	capabilityAudit?: SubagentCapabilityAudit;
 	/** Non-fatal launch warnings; they do not change behavior. */
 	warnings: string[];
-	/** Builtin tools the agent declared but the host runtime does not provide. */
-	unavailableHostBuiltins: string[];
 }
 
 function extensionIdentifier(value: string): string {
@@ -253,6 +198,24 @@ function hasPermissionRules(rules: PermissionRules | undefined): boolean {
 export function formatRuntimeSnapshotMcpServersError(agentName: string | undefined, serverNames: readonly string[]): string {
 	const subject = agentName ? `Agent '${agentName}'` : "Subagent";
 	return `${subject} selects MCP tools from servers that exist only in pi-mcp-adapter's runtime snapshot (${serverNames.join(", ")}). MCP servers from the runtime snapshot cannot be provided to in-process children; MCP tools must come from an ambient adapter extension in a background child (\`async: true\`), so add the server to the adapter's configuration file instead.`;
+}
+
+/** Path-like entries load extensions instead of naming tools, so Pi never reads them as modifiers. */
+function isToolExtensionPath(entry: string): boolean {
+	return entry.includes("/") || entry.endsWith(".ts") || entry.endsWith(".js");
+}
+
+/**
+ * A child's `tools` list is a complete allowlist. Read as names, Pi's modifier
+ * entries would become required tools no child has, or mix with the names the
+ * plan adds into a list Pi rejects. The modifier rule is Pi's `isToolModifier`:
+ * a `+name` or `-name` entry edits Pi's default tool selection.
+ */
+export function assertNoToolModifierEntries(agentName: string | undefined, tools: readonly string[]): void {
+	const entries = tools.filter((entry) => /^[+-]/u.test(entry) && !isToolExtensionPath(entry));
+	if (entries.length === 0) return;
+	const subject = agentName ? `Agent '${agentName}'` : "Subagent";
+	throw new Error(`${subject} lists Pi tool modifier ${entries.length === 1 ? "entry" : "entries"} in \`tools\`: ${entries.join(", ")}. A child's \`tools\` list is the complete set of tools it gets, so +name and -name entries are not supported; name every tool the child needs, or omit \`tools\` and use \`excludeTools\` to drop one.`);
 }
 
 export function projectLaunchResolvedChildExtensions(
@@ -286,7 +249,6 @@ export function projectLaunchResolvedChildExtensions(
 }
 
 /**
- * Resolve the permission-system extension entry point when installed.
  * Returns the absolute path to the extension's main module, or undefined
  * when the package is not installed. Callers can check `autoInject` config
  * to decide whether to include it in child sessions.
@@ -341,32 +303,6 @@ export function resolvePermissionSystemExtension(): string | undefined {
 	return undefined;
 }
 
-/**
- * Extract the names of builtin tools the host provides. Use this to pass
- * `hostAvailableBuiltins` to `resolvePiLaunchToolPlan` so child tool plans
- * intersect known core slots with what the host actually supports. Wrapped
- * core slots count regardless of source; host-specific builtins count too.
- *
- * Returns `undefined` when builtin tool discovery fails or yields nothing,
- * so callers skip the intersection (fail-safe to allowing all declared tools).
- * This handles test mocks without proper tool registration and hosts whose
- * getAllTools() throws before extensions load.
- */
-export function getHostBuiltinToolNames(pi: Pick<ExtensionAPI, "getAllTools">): string[] | undefined {
-	try {
-		const builtins = pi
-			.getAllTools()
-			.filter((tool) => {
-				const source = (tool.sourceInfo as { source?: string } | undefined)?.source;
-				return source === "builtin" || PI_BUILTIN_TOOL_NAMES.has(tool.name);
-			})
-			.map((tool) => tool.name);
-		return builtins.length > 0 ? builtins : undefined;
-	} catch {
-		return undefined;
-	}
-}
-
 export function resolvePiLaunchToolPlan(
 	input: ResolvePiLaunchToolPlanInput,
 ): PiLaunchToolPlan {
@@ -382,21 +318,8 @@ export function resolvePiLaunchToolPlan(
 		capabilityCeiling?.allowedTools === undefined
 			? undefined
 			: new Set(capabilityCeiling.allowedTools);
-	const hostAvailableSet =
-		input.hostAvailableBuiltins === undefined
-			? undefined
-			: new Set(input.hostAvailableBuiltins);
-	const requestedBuiltinTools =
-		input.tools?.filter(
-			(tool) =>
-				!(tool.includes("/") || tool.endsWith(".ts") || tool.endsWith(".js")),
-		) ?? [];
-	if (input.requireReadTool && hostAvailableSet && !hostAvailableSet.has("read")) {
-		const agentLabel = input.agentName ? ` for agent '${input.agentName}'` : "";
-		throw new Error(
-			`Host runtime does not provide required tool 'read'${agentLabel} for lazy skill loading.`,
-		);
-	}
+	const requestedBuiltinTools = input.tools?.filter((tool) => !isToolExtensionPath(tool)) ?? [];
+	assertNoToolModifierEntries(input.agentName, input.tools ?? []);
 	if (input.requireReadTool && allowedToolSet && !allowedToolSet.has("read")) {
 		throw new Error(
 			`Capability ceiling from ${capabilityCeiling?.sources.join(", ") || "unknown source"} excludes required tool 'read' for lazy skill loading.`,
@@ -405,7 +328,7 @@ export function resolvePiLaunchToolPlan(
 	const ceilingFilteredBuiltinTools =
 		input.tools === undefined
 			? allowedToolSet
-				? [...allowedToolSet]
+				? [...allowedToolSet].filter((tool) => tool !== "subagent_command")
 				: []
 			: (input.requireReadTool &&
 				requestedBuiltinTools.length > 0 &&
@@ -414,12 +337,7 @@ export function resolvePiLaunchToolPlan(
 					? ["read", ...requestedBuiltinTools]
 					: requestedBuiltinTools
 				).filter((tool) => !allowedToolSet || allowedToolSet.has(tool));
-	const declaredBuiltinTools = hostAvailableSet
-		? ceilingFilteredBuiltinTools.filter((tool) => !PI_BUILTIN_TOOL_NAMES.has(tool) || hostAvailableSet.has(tool))
-		: ceilingFilteredBuiltinTools;
-	const unavailableHostBuiltins = hostAvailableSet
-		? ceilingFilteredBuiltinTools.filter((tool) => PI_BUILTIN_TOOL_NAMES.has(tool) && !hostAvailableSet.has(tool))
-		: [];
+	const declaredBuiltinTools = ceilingFilteredBuiltinTools;
 	const excludeTools = [...new Set((input.excludeTools ?? []).map((tool) => tool.trim()).filter(Boolean))];
 	const excludedToolSet = new Set(excludeTools);
 	const effectiveDeclaredBuiltinTools = declaredBuiltinTools.filter((tool) => !excludedToolSet.has(tool));
@@ -428,28 +346,26 @@ export function resolvePiLaunchToolPlan(
 		!excludedToolSet.has("subagent") &&
 		(!allowedToolSet || allowedToolSet.has("subagent"))
 	);
-	if (effectiveDeclaredBuiltinTools.includes("subagent_supervisor") && !fanoutAuthorized) {
-		throw new Error("Tool 'subagent_supervisor' requires fanout authorization: include 'subagent' in the effective tools allowlist or enable allowNestedSubagents.");
-	}
 	const toolExtensionPaths: string[] = capabilityCeiling?.denyExtensions
 		? []
-		: (input.tools ?? []).filter(
-				(tool) =>
-					!requestedBuiltinTools.includes(tool) &&
-					(tool.includes("/") || tool.endsWith(".ts") || tool.endsWith(".js")),
-			);
+		: (input.tools ?? []).filter(isToolExtensionPath);
 	const mcpResolution = capabilityCeiling?.denyExtensions
 		? { selections: [], unresolvedSelectors: [] }
-		: resolveMcpDirectToolResolution(input.mcpDirectTools, input.cwd, input.runtimeSnapshotHost);
+		: input.builtinMcpTools
+			// The runner applies the same ceilings again; filtering is idempotent.
+			? { selections: input.builtinMcpTools, unresolvedSelectors: [], builtin: true as const }
+			: resolveMcpDirectToolResolution(input.mcpDirectTools, input.cwd, input.runtimeSnapshotHost);
 	if (mcpResolution.runtimeServerNames?.length) {
 		throw new Error(formatRuntimeSnapshotMcpServersError(input.agentName, mcpResolution.runtimeServerNames));
 	}
 	if (mcpResolution.unresolvedSelectors.length > 0) {
-		throw new Error(formatUnresolvedMcpDirectToolSelectors(mcpResolution.unresolvedSelectors));
+		throw new Error(mcpResolution.builtin
+			? formatUnresolvedBuiltinMcpSelectors(input.agentName, mcpResolution.unresolvedSelectors)
+			: formatUnresolvedMcpDirectToolSelectors(mcpResolution.unresolvedSelectors));
 	}
 	const resolvedMcpSelections = mcpResolution.selections;
 	const resolvedMcpNames = new Set(resolvedMcpSelections.map((selection) => selection.name));
-	const legacyMcpNameCounts = countLegacyUnderscoreMcpToolNames(resolvedMcpSelections);
+	const legacyMcpNameCounts = mcpResolution.builtin ? new Map<string, number>() : countLegacyUnderscoreMcpToolNames(resolvedMcpSelections);
 	const effectiveMcpSelections = resolvedMcpSelections.filter(
 		(selection) =>
 			!allowedToolSet ||
@@ -459,6 +375,7 @@ export function resolvePiLaunchToolPlan(
 	const effectiveMcpTools = effectiveMcpSelections.map(
 		(selection) => selection.name,
 	);
+	const builtinMcpTools = mcpResolution.builtin ? effectiveMcpSelections : undefined;
 	const explicitToolAllowlist =
 		input.tools !== undefined ||
 		(input.mcpDirectTools?.length ?? 0) > 0 ||
@@ -493,11 +410,12 @@ export function resolvePiLaunchToolPlan(
 			? resolvePermissionSystemExtension()
 			: undefined;
 	if (input.fast && capabilityCeiling?.denyExtensions) throw new Error("fast mode requires a child runtime extension, but this launch denies extensions.");
-	const fastModeExtensions = resolveFastModeExtension({ fast: input.fast, model: input.model, modelCandidates: input.modelCandidates, agentName: input.agentName });
+	const fastModeExtensions = resolveFastModeExtension({ fast: input.fast, model: input.model, agentName: input.agentName });
+	// Resolved per launch: an in-place package update can swap a sibling's .ts for .js.
 	const runtimeExtensions = [
-		PROMPT_RUNTIME_EXTENSION_PATH,
+		resolveRuntimeModulePath(RUNTIME_EXTENSION_DIR, "subagent-prompt-runtime"),
 		...fastModeExtensions,
-		...(fanoutAuthorized ? [FANOUT_CHILD_EXTENSION_PATH] : []),
+		...(fanoutAuthorized ? [resolveRuntimeModulePath(FANOUT_CHILD_EXTENSION_DIR, "fanout-child")] : []),
 		...(permSystemExt ? [permSystemExt] : []),
 	];
 	const disableAmbientExtensions =
@@ -540,32 +458,6 @@ export function resolvePiLaunchToolPlan(
 					]),
 				]
 			: undefined;
-	const missingPermittedRepositoryTools = input.tools !== undefined
-		? missingPermittedRepositoryInspectionTools(unavailableHostBuiltins, excludeTools)
-		: [];
-	if (missingPermittedRepositoryTools.length > 0 && isReviewOrScoutLaneAgent(input.agentName)) {
-		throw new Error(formatReviewLaneToolContractFailure({
-			agentName: input.agentName,
-			missingTools: missingPermittedRepositoryTools,
-			requestedTools: requestedToolNames,
-			effectiveTools: effectiveToolAllowlist,
-			ceilingSources: capabilityCeiling?.sources,
-			excludeTools,
-		}));
-	}
-	// Host pruning also happens without a ceiling (and therefore without an
-	// audit). Use the existing non-fatal launch warnings rather than inventing
-	// a ceiling or treating the requested allowlist as a minimum requirement.
-	if (unavailableHostBuiltins.length > 0) {
-		const subject = input.agentName ? `Agent '${input.agentName}'` : "Subagent";
-		warnings.push(
-			`${subject}: host runtime tool availability omitted [${unavailableHostBuiltins.join(", ")}]. `
-				+ `Requested tool names: ${requestedToolNames ? `[${requestedToolNames.join(", ")}]` : "not explicitly specified"}; effective tool allowlist: [${effectiveToolAllowlist.join(", ")}]. `
-				+ (capabilityCeiling ? `Active capability ceiling sources: [${capabilityCeiling.sources.join(", ") || "unknown source"}]. ` : "")
-				+ (excludeTools.length > 0 ? `Explicit excludeTools: [${excludeTools.join(", ")}]. ` : "")
-				+ "This is a non-fatal tool-plan diagnostic, not verification of the child's runtime tool menu.",
-		);
-	}
 	const capabilityAudit = capabilityCeiling
 		? ({
 				ceiling: capabilityCeiling,
@@ -581,12 +473,7 @@ export function resolvePiLaunchToolPlan(
 				removedExtensionCount: capabilityCeiling.denyExtensions
 					? (input.extensions?.length ?? 0) +
 						(input.subagentOnlyExtensions?.length ?? 0) +
-						(input.tools ?? []).filter(
-							(tool) =>
-								tool.includes("/") ||
-								tool.endsWith(".ts") ||
-								tool.endsWith(".js"),
-						).length
+						(input.tools ?? []).filter(isToolExtensionPath).length
 					: 0,
 				requestedMcpToolCount: input.mcpDirectTools?.length ?? 0,
 				effectiveMcpTools,
@@ -603,7 +490,6 @@ export function resolvePiLaunchToolPlan(
 								capabilityCeilingAgentRestrictionSources(capabilityCeiling),
 						}
 					: {}),
-				...(unavailableHostBuiltins.length > 0 ? { unavailableHostBuiltins } : {}),
 			} satisfies SubagentCapabilityAudit)
 		: undefined;
 	return {
@@ -615,6 +501,7 @@ export function resolvePiLaunchToolPlan(
 		resolvedMcpSelections,
 		effectiveMcpSelections,
 		effectiveMcpTools,
+		builtinMcpTools,
 		explicitToolAllowlist,
 		internalTools,
 		effectiveToolAllowlist,
@@ -626,7 +513,6 @@ export function resolvePiLaunchToolPlan(
 		extensionArgs,
 		disableAmbientExtensions,
 		warnings,
-		unavailableHostBuiltins,
 		...(capabilityAudit ? { capabilityAudit } : {}),
 	};
 }

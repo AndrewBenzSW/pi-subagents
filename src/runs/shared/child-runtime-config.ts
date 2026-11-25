@@ -3,7 +3,6 @@ import type { ThinkingLevel } from "../../shared/model-info.ts";
 import type { NestedPathEntry } from "./nested-path.ts";
 import type { PermissionRules } from "./permissions.ts";
 import type { ChildWatchdogConfig, ChildWatchdogStatusEvent } from "../../watchdog/child-status.ts";
-import type { ResolvedWaitToolConfig } from "../background/wait-config.ts";
 import type { ChildToolDiagnostic } from "./tool-availability.ts";
 import type { ResolvedSubagentCapabilityCeiling } from "./capability-ceiling.ts";
 import type { RequiredChildExtensionSnapshot } from "../../shared/required-child-extensions.ts";
@@ -14,6 +13,12 @@ import type { RequiredChildExtensionSnapshot } from "../../shared/required-child
  * pi-subagents loaded into a child session stays inert.
  */
 export const SUBAGENT_CHILD_ENV = "PI_SUBAGENT_CHILD";
+/**
+ * Pid of the async runner, set by the runner itself. A session's extensions
+ * can compare it with process.pid to tell that the process outlives the
+ * session. Descendants inherit the value but have their own pid.
+ */
+export const SUBAGENT_RUNNER_PID_ENV = "PI_SUBAGENT_RUNNER_PID";
 /** Root parent session id the parent publishes for pi-permission-system ask forwarding. */
 export const SUBAGENT_PARENT_SESSION_ENV = "PI_SUBAGENT_PARENT_SESSION";
 
@@ -39,6 +44,8 @@ export interface ChildPermissions {
 export interface ChildStructuredOutput {
 	schema: JsonSchemaObject;
 	acceptanceReport?: "optional" | "required";
+	/** Authoritative child-local state set only after validated capture succeeds. */
+	terminalState?: { captured: boolean };
 	/** Receives the validated value; `acceptanceReport` is undefined when the child omitted it. */
 	capture: (value: unknown, acceptanceReport: unknown | undefined) => void;
 }
@@ -58,6 +65,7 @@ export interface ChildSupervisorMetadata {
  * that hosts the child session builds it and passes it to the hooks directly.
  */
 export interface ChildRuntimeConfig {
+	cwd?: string;
 	runId?: string;
 	agent?: string;
 	childIndex?: number;
@@ -86,9 +94,7 @@ export interface ChildRuntimeConfig {
 	permissions?: ChildPermissions;
 	toolBudget?: ResolvedToolBudget;
 	childWatchdog?: ChildWatchdogConfig;
-	/** Receives child watchdog status events. */
 	watchdogStatus?: (event: ChildWatchdogStatusEvent) => void;
-	waitTool: ResolvedWaitToolConfig;
 	runtimeState?: SubagentState;
 	holdFinalDrain?: (held: boolean) => void;
 	/** Installation-local downward owner-channel barrier; never inherited or serialized into descendants. */

@@ -17,30 +17,29 @@ import {
 } from "../profiles/profiles.ts";
 import type { SubagentParamsLike } from "../runs/foreground/subagent-executor.ts";
 import { findModelInfo, toModelInfo } from "../shared/model-info.ts";
-import { formatTokens, shortenPath } from "../shared/formatters.ts";
+import { shortenPath } from "../shared/formatters.ts";
+import { canRenderComponents } from "../shared/extension-context.ts";
 import { listAsyncRuns, formatAsyncRunProgressLabel, type AsyncRunSummary } from "../runs/background/async-status.ts";
 import { encodeInspectReply, handleInspectRpcArgs, INSPECT_WIDGET_KEY } from "../runs/background/inspect-rpc.ts";
 import { listScheduledRunSummaries } from "../runs/background/scheduled-runs.ts";
 import { resolveAsyncStatusChild } from "../runs/shared/child-identity.ts";
 import { readStatus } from "../shared/utils.ts";
-import { getArtifactPaths, getArtifactsDir } from "../shared/artifacts.ts";
-import { readWorkflowReceipt } from "../workflows/workflow-receipt.ts";
 import type { SlashSubagentResponse, SlashSubagentUpdate } from "./slash-bridge.ts";
 import { registerPromptWorkflowCommands } from "./prompt-workflows.ts";
+import { collectSubagentCost, formatSubagentCostReport } from "./subagent-cost.ts";
 import { openSubagentsAdmin } from "./subagents-admin.ts";
 import { SUBAGENT_GUIDE_TOPICS } from "../extension/subagent-guide.ts";
-import { openSubagentFleet } from "../tui/fleet.ts";
-import { createBuiltinInspectorPlugins } from "../inspectors/plugins.ts";
+import { getInspectorPlugins } from "../inspectors/plugins.ts";
 import {
 	applySlashUpdate,
 	buildSlashInitialResult,
 	failSlashResult,
 	finalizeSlashResult,
-	resolveSlashMessageDetails,
 } from "./slash-live-state.ts";
 import {
 	SLASH_RESULT_TYPE,
 	SLASH_TEXT_RESULT_TYPE,
+	SLASH_TEXT_VIEW_ONLY_DETAILS,
 	SLASH_SUBAGENT_CANCEL_EVENT,
 	SLASH_SUBAGENT_REQUEST_EVENT,
 	SLASH_SUBAGENT_RESPONSE_EVENT,
@@ -51,8 +50,8 @@ import {
 	type FleetKeybindingsConfig,
 	type SingleResult,
 	type SubagentState,
-	type Usage,
 } from "../shared/types.ts";
+import { waitCall } from "../shared/wait-call.ts";
 
 interface InlineConfig {
 	output?: string | false;
@@ -125,7 +124,7 @@ function discoverSlashAgents(pi: ExtensionAPI, cwd: string, scope: AgentScope): 
 		...(scope !== "project" ? all.user : []),
 		...(scope !== "user" ? all.project : []),
 	];
-	const merged = mergeRuntimeAgents(pi, discovered, configuredAgents);
+	const merged = mergeRuntimeAgents(pi, discovered, configuredAgents, { cwd, scope });
 	return { ...merged, unknownAgentDiagnosticContext: { ...unknownAgentDiagnosticContext(discovered), agents: merged.agents } };
 }
 
@@ -150,7 +149,7 @@ const makeProviderCompletions = (state: SubagentState) => (prefix: string) => {
 };
 
 function sendSlashText(pi: ExtensionAPI, text: string): void {
-	pi.sendMessage({ customType: SLASH_TEXT_RESULT_TYPE, content: text, display: true });
+	pi.sendMessage({ customType: SLASH_TEXT_RESULT_TYPE, content: text, display: true, details: SLASH_TEXT_VIEW_ONLY_DETAILS });
 }
 
 async function withSlashStatus<T>(
@@ -176,7 +175,9 @@ type StopSelectorTarget = {
 	actionLabel: string;
 };
 
-type StopSelectorResult = { confirmed: boolean; target?: StopSelectorTarget };
+type StopAllTarget = Omit<StopSelectorTarget, "kind" | "id"> & { kind: "all"; ids: string[] };
+type StopPickerTarget = StopSelectorTarget | StopAllTarget;
+type StopSelectorResult = { confirmed: boolean; target?: StopPickerTarget };
 
 function commandForTarget(target: StopSelectorTarget): string {
 	return target.kind === "scheduled"
@@ -234,6 +235,12 @@ function stopFallbackText(targets: StopSelectorTarget[]): string {
 	return lines.join("\n");
 }
 
+function stopPickerTargets(targets: StopSelectorTarget[]): StopPickerTarget[] {
+	const ids = targets.filter((target) => target.kind === "async").map((target) => target.id);
+	if (ids.length < 2) return targets;
+	return [{ kind: "all", ids, label: `${ids.length} async runs`, detail: ids.join(", "), actionLabel: "stop all" }, ...targets];
+}
+
 function selectForegroundDetachControl(state: SubagentState, requested: string) {
 	const controls = [...state.foregroundControls.values()];
 	if (requested) {
@@ -255,10 +262,10 @@ class SubagentsStopSelector implements Component {
 	private confirming = false;
 	private readonly tui: TUI;
 	private readonly theme: Theme;
-	private readonly targets: StopSelectorTarget[];
+	private readonly targets: StopPickerTarget[];
 	private readonly done: (result: StopSelectorResult) => void;
 
-	constructor(tui: TUI, theme: Theme, targets: StopSelectorTarget[], done: (result: StopSelectorResult) => void) {
+	constructor(tui: TUI, theme: Theme, targets: StopPickerTarget[], done: (result: StopSelectorResult) => void) {
 		this.tui = tui;
 		this.theme = theme;
 		this.targets = targets;
@@ -308,9 +315,8 @@ class SubagentsStopSelector implements Component {
 			const target = this.targets[index]!;
 			const selected = index === this.selected;
 			const marker = selected ? "›" : " ";
-				const actionLabel = target.actionLabel;
-			const action = target.kind === "scheduled" ? this.theme.fg("warning", actionLabel) : this.theme.fg("accent", actionLabel);
-			const labelWidth = Math.max(0, contentWidth - marker.length - actionLabel.length - 2);
+			const action = target.kind === "scheduled" ? this.theme.fg("warning", target.actionLabel) : this.theme.fg("accent", target.actionLabel);
+			const labelWidth = Math.max(0, contentWidth - marker.length - target.actionLabel.length - 2);
 			lines.push(`${marker} ${action} ${target.label.slice(0, labelWidth)}`);
 			if (selected) lines.push(this.theme.fg("dim", `  ${target.detail}`.slice(0, contentWidth)));
 		}
@@ -318,245 +324,14 @@ class SubagentsStopSelector implements Component {
 		lines.push("");
 		if (this.confirming) {
 			const target = this.targets[this.selected]!;
-			lines.push(this.theme.fg("warning", `Confirm: ${target.actionLabel} ${target.id}?`));
-			if (target.kind === "async") lines.push(this.theme.fg("dim", "Stop ends this run; use interrupt for a resumable pause."));
+			lines.push(this.theme.fg("warning", `Confirm: ${target.actionLabel} ${target.kind === "all" ? target.label : target.id}?`));
+			if (target.kind !== "scheduled") lines.push(this.theme.fg("dim", target.kind === "all" ? "Stop ends these runs; scheduled runs are not paused." : "Stop ends this run; use interrupt for a resumable pause."));
 			lines.push(this.theme.fg("dim", "Enter/Y confirms · N returns · Esc cancels"));
 		} else {
 			lines.push(this.theme.fg("dim", "↑↓/jk select · Enter confirm · Esc cancel"));
 		}
 		return lines.map((line) => truncateToWidth(line, contentWidth));
 	}
-}
-
-function emptyUsage(): Usage {
-	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
-}
-
-function addUsage(target: Usage, source: Usage): void {
-	target.input += source.input;
-	target.output += source.output;
-	target.cacheRead += source.cacheRead;
-	target.cacheWrite += source.cacheWrite;
-	target.cost += source.cost;
-	target.turns += source.turns;
-}
-
-function usageHasValue(usage: Usage): boolean {
-	return usage.input !== 0 || usage.output !== 0 || usage.cacheRead !== 0 || usage.cacheWrite !== 0 || usage.cost !== 0 || usage.turns !== 0;
-}
-
-function nonNegativeNumber(value: unknown): number | undefined {
-	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
-}
-
-function usageFromValue(value: unknown, turnsOverride?: number): Usage | undefined {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-	const record = value as Record<string, unknown>;
-	const costValue = typeof record.cost === "object" && record.cost !== null && !Array.isArray(record.cost)
-		? (record.cost as Record<string, unknown>).total
-		: record.cost;
-	const turnsValue = turnsOverride ?? record.turns;
-	const usage = {
-		input: nonNegativeNumber(record.input) ?? 0,
-		output: nonNegativeNumber(record.output) ?? 0,
-		cacheRead: nonNegativeNumber(record.cacheRead) ?? 0,
-		cacheWrite: nonNegativeNumber(record.cacheWrite) ?? 0,
-		cost: nonNegativeNumber(costValue) ?? 0,
-		turns: nonNegativeNumber(turnsValue) ?? 0,
-	};
-	return Number.isSafeInteger(usage.turns) ? usage : undefined;
-}
-
-function assistantUsageFromMessage(message: unknown): Usage | undefined {
-	if (!message || typeof message !== "object") return undefined;
-	const msg = message as { role?: unknown; usage?: unknown };
-	return msg.role === "assistant" ? usageFromValue(msg.usage, 1) : undefined;
-}
-
-function compactionUsageFromEntry(entry: unknown): Usage | undefined {
-	if (!entry || typeof entry !== "object") return undefined;
-	const record = entry as { type?: unknown; usage?: unknown };
-	return record.type === "compaction" ? usageFromValue(record.usage, 0) : undefined;
-}
-
-const MAX_USAGE_METADATA_BYTES = 2 * 1024 * 1024;
-
-function readUsageMetadata(metadataPath: string): Record<string, unknown> | undefined {
-	let fd: number | undefined;
-	try {
-		fd = fs.openSync(metadataPath, "r");
-		const stat = fs.fstatSync(fd);
-		if (!stat.isFile() || stat.size > MAX_USAGE_METADATA_BYTES) return undefined;
-		const buffer = Buffer.allocUnsafe(stat.size);
-		let offset = 0;
-		while (offset < buffer.length) {
-			const bytesRead = fs.readSync(fd, buffer, offset, buffer.length - offset, null);
-			if (bytesRead <= 0) return undefined;
-			offset += bytesRead;
-		}
-		const value: unknown = JSON.parse(buffer.toString("utf-8"));
-		return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
-	} finally {
-		if (fd !== undefined) fs.closeSync(fd);
-	}
-}
-
-function isSubagentDetails(value: unknown): value is Details {
-	if (!value || typeof value !== "object") return false;
-	const details = value as { mode?: unknown; results?: unknown };
-	return typeof details.mode === "string" && Array.isArray(details.results);
-}
-
-function detailsFromSessionEntry(entry: unknown): Details | undefined {
-	if (!entry || typeof entry !== "object") return undefined;
-	const record = entry as { type?: unknown; customType?: unknown; details?: unknown; message?: unknown };
-	if (record.type === "custom_message" && record.customType === SLASH_RESULT_TYPE) {
-		const details = resolveSlashMessageDetails(record.details)?.result.details;
-		return isSubagentDetails(details) ? details : undefined;
-	}
-	if (record.type !== "message" || !record.message || typeof record.message !== "object") return undefined;
-	const message = record.message as { role?: unknown; toolName?: unknown; details?: unknown };
-	if (message.role !== "toolResult" || (message.toolName !== "subagent" && message.toolName !== "bg_wait")) return undefined;
-	return isSubagentDetails(message.details) ? message.details : undefined;
-}
-
-function metadataUsage(
-	artifactsDirs: string[],
-	input: { runId: string; agent: string },
-): Usage | undefined {
-	if (!/^[A-Za-z0-9._-]+$/.test(input.runId)) return undefined;
-	for (const artifactsDir of artifactsDirs) {
-		for (const index of [0, undefined] as const) {
-			const metadataPath = getArtifactPaths(artifactsDir, input.runId, input.agent, index).metadataPath;
-			try {
-				const metadata = readUsageMetadata(metadataPath);
-				if (!metadata) continue;
-				if (metadata.runId !== input.runId || metadata.agent !== input.agent) continue;
-				const usage = usageFromValue(metadata.usage);
-				if (usage && usageHasValue(usage)) return usage;
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "ENOENT") console.error(`Failed to read subagent usage metadata '${metadataPath}':`, error);
-			}
-		}
-	}
-	return undefined;
-}
-
-function formatCostUsage(label: string, usage: Usage): string {
-	const extras = [
-		usage.cacheRead ? `cache read ${formatTokens(usage.cacheRead)}` : "",
-		usage.cacheWrite ? `cache write ${formatTokens(usage.cacheWrite)}` : "",
-		usage.turns ? `${usage.turns} turn${usage.turns === 1 ? "" : "s"}` : "",
-	].filter(Boolean);
-	return `${label}: ↑${formatTokens(usage.input)} ↓${formatTokens(usage.output)} $${usage.cost.toFixed(4)}${extras.length ? ` (${extras.join(", ")})` : ""}`;
-}
-
-function buildSubagentCostReport(ctx: ExtensionContext, state: SubagentState): string {
-	const parent = emptyUsage();
-	const childTotal = emptyUsage();
-	const total = emptyUsage();
-	const children: Array<{ label: string; usage: Usage; sessionFile?: string }> = [];
-	const seenChildren = new Set<string>();
-	const workflowRunIds = new Set<string>();
-	let unresolvedAsyncChildren = 0;
-
-	const addChild = (input: { agent?: string; runId?: string; usage?: Usage; sessionFile?: string }): boolean => {
-		if (!input.usage || !usageHasValue(input.usage)) return false;
-		const identity = input.runId ? `run:${input.runId}` : input.sessionFile ? `session:${input.sessionFile}` : undefined;
-		if (identity && seenChildren.has(identity)) return true;
-		if (identity) seenChildren.add(identity);
-		const usage = { ...input.usage };
-		children.push({
-			label: `Child ${children.length + 1} (${input.agent ?? "unknown"})`,
-			usage,
-			...(input.sessionFile ? { sessionFile: input.sessionFile } : {}),
-		});
-		addUsage(childTotal, usage);
-		return true;
-	};
-
-	for (const entry of ctx.sessionManager.getBranch()) {
-		const message = entry.type === "message" ? (entry as { message?: unknown }).message : undefined;
-		const parentUsage = assistantUsageFromMessage(message) ?? compactionUsageFromEntry(entry);
-		if (parentUsage) addUsage(parent, parentUsage);
-		const details = detailsFromSessionEntry(entry);
-		if (!details) continue;
-		if (details.mode === "workflow" && details.runId) workflowRunIds.add(details.runId);
-		for (const result of details.results) {
-			const resultRunId = (result as SingleResult & { runId?: unknown }).runId;
-			addChild({ agent: result.agent, runId: typeof resultRunId === "string" ? resultRunId : undefined, usage: usageFromValue(result.usage), sessionFile: result.sessionFile });
-		}
-		for (const completion of details.completions ?? []) {
-			if (completion.mode === "workflow") workflowRunIds.add(completion.runId);
-			for (const result of completion.results ?? []) {
-				addChild({ agent: result.agent, runId: result.runId, usage: usageFromValue(result.usage), sessionFile: result.sessionFile });
-			}
-		}
-	}
-
-	let sessionFile: string | null = null;
-	try {
-		sessionFile = ctx.sessionManager.getSessionFile() ?? null;
-	} catch { /* an unpersisted session can still report direct child usage */ }
-	const artifactsDirs = new Set<string>();
-	const addArtifactsDir = (cwd: string | undefined): void => {
-		try {
-			artifactsDirs.add(getArtifactsDir(sessionFile, cwd, state.artifactDirPreference));
-		} catch { /* invalid or unavailable project roots are ignored */ }
-	};
-	addArtifactsDir(ctx.cwd);
-	addArtifactsDir(state.baseCwd);
-
-	for (const workflowRunId of workflowRunIds) {
-		try {
-			const status = readStatus(path.join(DIRS.async, workflowRunId));
-			addArtifactsDir(status?.cwd);
-			const receipt = readWorkflowReceipt(DIRS.async, workflowRunId);
-			const summaryChildren = new Map((receipt.workflowChildren?.children ?? []).map((child) => [child.childId, child]));
-			const refsByRunId = new Map<string, { runId: string; agent: string }>();
-			const addRef = (runId: string | undefined, agent: string | undefined): void => {
-				if (!runId || !agent || refsByRunId.has(runId)) return;
-				refsByRunId.set(runId, { runId, agent });
-			};
-			for (const [key, entry] of Object.entries(receipt.entries)) {
-				const summaryChild = summaryChildren.get(key);
-				const runIds = entry.continuation?.runIds?.length
-					? entry.continuation.runIds
-					: entry.latestRunId ? [entry.latestRunId] : summaryChild?.runId ? [summaryChild.runId] : [];
-				for (const runId of runIds) addRef(runId, entry.agent ?? summaryChild?.agent);
-			}
-			for (const child of receipt.workflowChildren?.children ?? []) {
-				if (!Object.hasOwn(receipt.entries, child.childId)) addRef(child.runId, child.agent);
-			}
-			const refs = [...refsByRunId.values()];
-			for (const ref of refs) {
-				if (seenChildren.has(`run:${ref.runId}`)) continue;
-				const usage = metadataUsage([...artifactsDirs], ref);
-				if (!usage || !addChild({ ...ref, usage })) unresolvedAsyncChildren += 1;
-			}
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT") console.error(`Failed to resolve async subagent usage for '${workflowRunId}':`, error);
-		}
-	}
-
-	addUsage(total, parent);
-	addUsage(total, childTotal);
-	const lines = [
-		"Subagent cost",
-		"",
-		formatCostUsage("Parent", parent),
-	];
-	if (children.length === 0) {
-		lines.push("No subagent child usage found in this session.");
-	} else {
-		for (const child of children) {
-			lines.push(formatCostUsage(child.label, child.usage));
-			if (child.sessionFile) lines.push(`  Session: ${child.sessionFile}`);
-		}
-	}
-	if (unresolvedAsyncChildren > 0) lines.push(`Async child usage unavailable: ${unresolvedAsyncChildren}.`);
-	lines.push("────────────────────────────", formatCostUsage("Children", childTotal), formatCostUsage("Total", total));
-	return lines.join("\n");
 }
 
 function parseSingleRequiredArg(args: string, usage: string): { ok: true; value: string } | { ok: false; message: string } {
@@ -632,7 +407,7 @@ async function requestSlashRun(
 				const tool = update.currentTool ? ` ${update.currentTool}` : "";
 				const count = update.toolCount ?? 0;
 				const liveDetailKey = keyText("app.tools.expand");
-				ctx.ui.setStatus("subagent-slash", `${count} tools${tool} | ${liveDetailKey} live detail`);
+				ctx.ui.setStatus("subagent-slash", `${count} tools${tool}${liveDetailKey ? ` | ${liveDetailKey} live detail` : ""}`);
 			} catch (error) {
 				if (isStaleExtensionContextError(error)) {
 					finish(() => reject(error));
@@ -827,14 +602,19 @@ async function runSlashSubagent(
 	}
 }
 
-function slashRunWorkflowScript(key: string, child: Record<string, unknown>): string {
+function slashRunWorkflowScript(key: string, child: SubagentParamsLike): string {
 	return `return runs.run(${JSON.stringify(key)}, ${JSON.stringify(child)})`;
 }
 
 export function registerSlashCommands(
 	pi: ExtensionAPI,
 	state: SubagentState,
-	options: { fleetKeybindings?: FleetKeybindingsConfig; foregroundDetachShortcut?: string } = {},
+	options: {
+		fleetKeybindings?: FleetKeybindingsConfig;
+		foregroundDetachShortcut?: string;
+		/** disabledFeatures "workflow-scripts": /run launches its one child directly instead of through a script. */
+		workflowScriptsDisabled?: boolean;
+	} = {},
 ): { dispose: () => void } {
 	let fleetOpen = false;
 	let disposed = false;
@@ -850,7 +630,7 @@ export function registerSlashCommands(
 	};
 	const showFleet = async (ctx: ExtensionContext) => {
 		state.lastUiContext = ctx;
-		if (!ctx.hasUI) {
+		if (!canRenderComponents(ctx)) {
 			await runCommand(ctx, { action: "status", view: "fleet" });
 			return;
 		}
@@ -860,7 +640,8 @@ export function registerSlashCommands(
 		}
 		fleetOpen = true;
 		try {
-			await openSubagentFleet(ctx, state, { asyncDirRoot: DIRS.async, inspectorPlugins: createBuiltinInspectorPlugins(), resultsDir: DIRS.results, fleetKeybindings: options.fleetKeybindings });
+			const { openSubagentFleet } = await import("../tui/fleet.ts");
+			await openSubagentFleet(ctx, state, { asyncDirRoot: DIRS.async, inspectorPlugins: () => getInspectorPlugins(pi), resultsDir: DIRS.results, fleetKeybindings: options.fleetKeybindings });
 		} finally {
 			fleetOpen = false;
 		}
@@ -874,7 +655,7 @@ export function registerSlashCommands(
 	});
 
 	pi.registerCommand("run", {
-		description: "Run one subagent through workflowScript: /run agent[output=file] [task] [--bg] [--fork]",
+		description: "Run one subagent through a workflow script: /run agent[output=file] [task] [--bg] [--fork]",
 		getArgumentCompletions: makeAgentCompletions(pi, state),
 		handler: async (args, ctx) => {
 			const { args: cleanedArgs, bg, fork } = extractExecutionFlags(args);
@@ -901,20 +682,20 @@ export function registerSlashCommands(
 				const existingReads = inline.reads.filter((read) => resolveExistingReadPaths([read], state.baseCwd).length > 0);
 				if (existingReads.length > 0) finalTask = `[Read from: ${existingReads.join(", ")}]\n\n${finalTask}`;
 			}
-			const child: Record<string, unknown> = { agent: agentName, task: finalTask, agentScope: "both" };
+			const child: SubagentParamsLike = { agent: agentName, task: finalTask, agentScope: "both" };
 			if (inline.output !== undefined) child.output = inline.output;
 			if (inline.outputMode !== undefined) child.outputMode = inline.outputMode;
 			if (inline.skill !== undefined) child.skill = inline.skill;
 			if (inline.model) child.model = inline.model;
 			if (fork) child.context = "fork";
-			launchCommand(ctx, { workflowScript: slashRunWorkflowScript("run", child), async: bg ? true : false });
+			launchCommand(ctx, options.workflowScriptsDisabled ? { ...child, async: bg } : { workflowScript: slashRunWorkflowScript("run", child), async: bg });
 		},
 	});
 
 	pi.registerCommand("subagent-cost", {
 		description: "Show parent and subagent child usage cost for this session",
 		handler: async (_args, ctx) => {
-			sendSlashText(pi, buildSubagentCostReport(ctx, state));
+			sendSlashText(pi, formatSubagentCostReport(collectSubagentCost(ctx, state)));
 		},
 	});
 
@@ -929,7 +710,7 @@ export function registerSlashCommands(
 		description: "Host integration bridge: answer an async child inspection request with a correlated widget payload (no model turn)",
 		handler: async (args, ctx) => {
 			if (ctx.mode === "tui") {
-				ctx.ui.notify("Inspection replies are emitted only on RPC surfaces. Use /subagents or subagent({ action: \"status\", view: \"transcript\" }) interactively.", "info");
+				ctx.ui.notify("Inspection replies are emitted only on RPC surfaces. Use /subagents or subagent({ action: \"status\", options: { view: \"transcript\" } }) interactively.", "info");
 				return;
 			}
 			if (!ctx.hasUI) return;
@@ -996,7 +777,7 @@ export function registerSlashCommands(
 			ctx.ui.notify(`Foreground run ${control.runId} is not currently detachable.`, "info");
 			return;
 		}
-		sendSlashText(pi, `Detached foreground run ${control.runId} without terminating its child. Use subagent({ action: "status", id: ${JSON.stringify(control.runId)} }) or bg_wait({ id: ${JSON.stringify(control.runId)} }) to recover the eventual result. This does not daemonize the process or guarantee survival across Pi reload/restart.`);
+		sendSlashText(pi, `Detached foreground run ${control.runId} without terminating its child. Use subagent({ action: "status", id: ${JSON.stringify(control.runId)} }) or ${waitCall(`id: ${JSON.stringify(control.runId)}`)} to recover the eventual result. This does not daemonize the process or guarantee survival across Pi reload/restart.`);
 	};
 
 	pi.registerCommand("subagents-detach", {
@@ -1032,7 +813,7 @@ export function registerSlashCommands(
 				ctx.ui.notify(message, "error");
 				return;
 			}
-			if (!ctx.hasUI) {
+			if (!canRenderComponents(ctx)) {
 				sendSlashText(pi, stopFallbackText(targets));
 				return;
 			}
@@ -1042,10 +823,14 @@ export function registerSlashCommands(
 			}
 
 			const result = await ctx.ui.custom<StopSelectorResult>(
-				(tui, theme, _kb, done) => new SubagentsStopSelector(tui, theme, targets, done),
+				(tui, theme, _kb, done) => new SubagentsStopSelector(tui, theme, stopPickerTargets(targets), done),
 				{ overlay: true, overlayOptions: { anchor: "center", width: 88, maxHeight: "80%" } },
 			);
 			if (!result?.confirmed || !result.target) return;
+			if (result.target.kind === "all") {
+				for (const id of result.target.ids) await runCommand(ctx, { action: "stop", id });
+				return;
+			}
 			if (result.target.kind === "scheduled") {
 				await runCommand(ctx, { action: "schedule.pause", id: result.target.id });
 				return;

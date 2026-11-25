@@ -9,6 +9,7 @@ import { renderSubagentResult } from "../../src/tui/render.ts";
 import { bindMissionWorkflowChildAsyncLaunch, createSubagentExecutor, foregroundResultIntercomStatus, missionWorkflowChildStatus, runMissionWorkflowChild, shouldSuppressRoutineResultIntercom } from "../../src/runs/foreground/subagent-executor.ts";
 import { encodeIndexSegment } from "../../src/runs/background/index-segment.ts";
 import { readMissionBinding } from "../../src/missions/lifecycle.ts";
+import { nestedRunScope } from "../../src/runs/shared/nested-events.ts";
 import { createMission, readMission } from "../../src/missions/store.ts";
 import { DIRS, type Details, type SingleResult, type SubagentState } from "../../src/shared/types.ts";
 
@@ -123,7 +124,8 @@ describe("workflow chat progress rendering", () => {
 				const result = await createExecutor().execute(
 					"wf-headless",
 					{
-						workflowScript: `return await runs.run("scout", { agent: "missing-agent", task: "scan" });`,
+						// A non-literal agent reaches launch-time resolution instead of pre-launch validation.
+						workflowScript: `const agent = "missing-agent"; return await runs.run("scout", { agent, task: "scan" });`,
 						async: false,
 						chatProgress: scenario === "explicit off" ? "off" : "auto",
 						...(other ? { cwd: other } : {}),
@@ -181,7 +183,7 @@ describe("workflow chat progress rendering", () => {
 			const updates: Array<{ details?: Details }> = [];
 			const result = await createExecutor().execute(
 				toolCallId,
-				{ workflowScript: `return await runs.run("scout", { agent: "missing-agent", task: "scan", phase: "Validation", label: "Find renderer seam" });`, async: false },
+				{ workflowScript: `const agent = "missing-agent"; return await runs.run("scout", { agent, task: "scan", phase: "Validation", label: "Find renderer seam" });`, async: false },
 				new AbortController().signal,
 				(update) => updates.push(update),
 				ctx(repo),
@@ -214,10 +216,10 @@ describe("workflow chat progress rendering", () => {
 		} as any), "running");
 	});
 
-	it("writes mission binding before async workflow child launch", () => {
+	for (const nestedRootRunId of [undefined, "binding-root"]) it(`writes mission binding at the actual async launch location (${nestedRootRunId ?? "top-level"})`, () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-workflow-child-binding-"));
 		const asyncId = `workflow-child-${process.pid}-${Date.now()}`;
-		const asyncDir = path.join(DIRS.async, asyncId);
+		const asyncDir = path.join(nestedRootRunId ? nestedRunScope(nestedRootRunId).asyncDirRoot : DIRS.async, asyncId);
 		try {
 			const location = {
 				projectRoot: root,
@@ -231,10 +233,12 @@ describe("workflow chat progress rendering", () => {
 				{ missionId: mission.id, location, autoCreated: false },
 				false,
 				asyncId,
+				nestedRootRunId,
 			);
 
 			assert.equal(params.workflowChildAsyncId, asyncId);
 			assert.equal(readMissionBinding(asyncDir)?.missionId, mission.id);
+			if (nestedRootRunId) assert.equal(fs.existsSync(path.join(DIRS.async, asyncId)), false);
 		} finally {
 			fs.rmSync(asyncDir, { recursive: true, force: true });
 			fs.rmSync(root, { recursive: true, force: true });
@@ -316,7 +320,7 @@ describe("workflow chat progress rendering", () => {
 						{ operation: "run", key: "scout", state: "completed", runId: "run-scout", phase: "Validation", label: "Found renderer seam", durationMs: 12 },
 						{ operation: "run", key: "tests", state: "started", phase: "Validation", label: "focused integration suite" },
 						{ operation: "run", key: "review", state: "failed", phase: "Validation", label: "fresh-context UX review", error: "needs fixes" },
-						{ operation: "run", key: "stale", state: "stopped", phase: "Validation", label: "superseded exact-head review", error: "Workflow stopped by user." },
+						{ operation: "run", key: "stale", state: "stopped", phase: "Validation", label: "superseded exact-head review", error: "Workflow stopped." },
 					],
 					emits: [],
 					console: [],
@@ -330,7 +334,7 @@ describe("workflow chat progress rendering", () => {
 		assert.match(text, /complete\s+scout Found renderer seam/);
 		assert.match(text, /running\s+tests focused integration suite/);
 		assert.match(text, /failed\s+review fresh-context UX review .* needs fixes/);
-		assert.match(text, /stopped\s+stale superseded exact-head review .* Workflow stopped by user/);
+		assert.match(text, /stopped\s+stale superseded exact-head review .* Workflow stopped\./);
 	});
 
 	it("renders detached workflow trace rows as paused attention", () => {

@@ -2,15 +2,26 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Key } from "@earendil-works/pi-tui";
-import { FLEET_KEYBINDING_ACTIONS, type ArtifactDirPreference, type ExtensionConfig } from "../shared/types.ts";
+import { FLEET_KEYBINDING_ACTIONS, RUNNER_LAUNCHER_NAME_PATTERN, RUNNER_LAUNCHER_NAME_RULE, type ArtifactDirPreference, type ExtensionConfig } from "../shared/types.ts";
 import { validateMissionStoreConfig } from "../missions/store.ts";
 import { validateAuthorityPolicy } from "../policy/authority.ts";
 import { getAgentDir } from "../shared/utils.ts";
-import { DEFAULT_MODEL_EXCLUSION_TTL_MS, MAX_MODEL_EXCLUSION_TTL_MS, setDefaultTTL } from "../runs/shared/model-exclusions.ts";
 import { validatePermissionConfig } from "../runs/shared/permissions.ts";
 import { MAX_ABANDONED_SLOT_RELEASE_AFTER_MS, MIN_ABANDONED_SLOT_RELEASE_AFTER_MS } from "../runs/background/active-async-capacity.ts";
 import { normalizeWorktreeBranchPrefix } from "../runs/shared/worktree.ts";
 import { validateModelResponseAliases } from "../shared/model-response-aliases.ts";
+import { validateDisabledFeatures } from "../shared/disabled-features.ts";
+
+// Explicit route identity, worktree, checkpoint, and tool-surface policies must not be silently
+// discarded and replaced by the built-in defaults after validation fails.
+const FAIL_CLOSED_CONFIG_KEYS = ["worktreeProvider", "worktreeBranchPrefix", "modelResponseAliases", "modelExclusions", "checkpointBeforeDeadlineMs", "disabledFeatures", "scheduledRuns", "authorityPolicy", "permissions", "toolBudget", "runnerLaunchers", "globalConcurrencyLimit"];
+
+const REMOVED_CONFIG_KEYS: Record<string, string> = {
+	toolActivation: "the subagent tool is now always declared, small and unchanging; remove the key",
+	toolExposure: 'codemode scripts can always call subagent, and codemode.mode "only" in Pi settings hides it from the model; remove the key',
+	toolDescriptionMode: "the subagent tool description is now fixed and its first reply is the guide; remove the key",
+	waitTool: 'waiting is subagent({action:"wait"}); remove the key',
+};
 
 const ARTIFACT_DIR_PREFERENCES = new Set<ArtifactDirPreference>(["project", "session", "temp"]);
 const FLEET_KEYBINDING_ACTION_SET = new Set<string>(FLEET_KEYBINDING_ACTIONS);
@@ -56,6 +67,8 @@ export function resolveScheduledStoreRoot(value: string): string {
 function validateScheduledRunsConfig(value: unknown): void {
 	if (value === undefined) return;
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("config.scheduledRuns must be a JSON object");
+	const enabled = (value as Record<string, unknown>).enabled;
+	if (enabled !== undefined && typeof enabled !== "boolean") throw new Error("config.scheduledRuns.enabled must be a boolean");
 	const storeRoot = (value as Record<string, unknown>).storeRoot;
 	if (storeRoot === undefined) return;
 	if (typeof storeRoot !== "string" || !storeRoot.trim()) throw new Error("config.scheduledRuns.storeRoot must be a non-empty string");
@@ -97,14 +110,15 @@ function validateCapacityConfig(value: unknown): void {
 	}
 }
 
-/** Validate the user-controlled TTL policy before it reaches the exclusion store. */
-// TEST:test/unit/pi-coding-agent-dir.test.ts[loads and applies model exclusion TTL config]
-function validateModelExclusionsConfig(value: unknown): void {
+function validateRunnerLaunchersConfig(value: unknown): void {
 	if (value === undefined) return;
-	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("config.modelExclusions must be a JSON object");
-	const defaultTtlMs = (value as Record<string, unknown>).defaultTtlMs;
-	if (defaultTtlMs !== undefined && (typeof defaultTtlMs !== "number" || !Number.isFinite(defaultTtlMs) || defaultTtlMs <= 0 || defaultTtlMs > MAX_MODEL_EXCLUSION_TTL_MS)) {
-		throw new Error(`config.modelExclusions.defaultTtlMs must be a finite positive number no greater than ${MAX_MODEL_EXCLUSION_TTL_MS}`);
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("config.runnerLaunchers must be a JSON object mapping launcher names to argv arrays");
+	for (const [name, argv] of Object.entries(value)) {
+		const label = `config.runnerLaunchers[${JSON.stringify(name)}]`;
+		if (!RUNNER_LAUNCHER_NAME_PATTERN.test(name)) throw new Error(`${label} has an invalid name; launcher names ${RUNNER_LAUNCHER_NAME_RULE}`);
+		if (!Array.isArray(argv) || argv.length === 0 || argv.some((arg) => typeof arg !== "string" || !arg.trim() || arg.includes("\u0000"))) {
+			throw new Error(`${label} must be a non-empty argv array of non-blank strings without NUL characters`);
+		}
 	}
 }
 
@@ -140,6 +154,9 @@ function validateMainWindowRendererConfig(value: unknown): void {
 }
 
 function validateConfig(config: Record<string, unknown>): void {
+	for (const [key, replacement] of Object.entries(REMOVED_CONFIG_KEYS)) {
+		if (Object.hasOwn(config, key)) throw new Error(`config.${key} was removed: ${replacement}.`);
+	}
 	if (config.worktree !== undefined && typeof config.worktree !== "boolean") {
 		throw new Error("config.worktree must be a boolean");
 	}
@@ -174,20 +191,58 @@ function validateConfig(config: Record<string, unknown>): void {
 			|| config.maxActiveAsyncRunsPerSession < 0)) {
 		throw new Error("config.maxActiveAsyncRunsPerSession must be a non-negative integer");
 	}
+	if (config.globalConcurrencyLimit !== undefined
+		&& (typeof config.globalConcurrencyLimit !== "number"
+			|| !Number.isInteger(config.globalConcurrencyLimit)
+			|| config.globalConcurrencyLimit < 1)) {
+		throw new Error("config.globalConcurrencyLimit must be a positive integer");
+	}
 	if (config.resultScanLogging !== undefined && config.resultScanLogging !== "all" && config.resultScanLogging !== "activity" && config.resultScanLogging !== "off") {
 		throw new Error('config.resultScanLogging must be "all", "activity", or "off"');
+	}
+	if (config.asyncWidgetCollapsed !== undefined && typeof config.asyncWidgetCollapsed !== "boolean") {
+		throw new Error("config.asyncWidgetCollapsed must be a boolean");
+	}
+	if (config.asyncWidgetLayout !== undefined && config.asyncWidgetLayout !== "adaptive" && config.asyncWidgetLayout !== "rows") {
+		throw new Error('config.asyncWidgetLayout must be "adaptive" or "rows"');
+	}
+	if (config.fastServiceTier !== undefined && config.fastServiceTier !== "priority" && config.fastServiceTier !== "ultrafast") {
+		throw new Error('config.fastServiceTier must be "priority" or "ultrafast"');
+	}
+	if (config.programStatus !== undefined && typeof config.programStatus !== "boolean") {
+		throw new Error("config.programStatus must be a boolean");
+	}
+	if (config.activeRunsPrompt !== undefined && typeof config.activeRunsPrompt !== "boolean") {
+		throw new Error("config.activeRunsPrompt must be a boolean");
+	}
+	if (config.pinToolDeclarations !== undefined && typeof config.pinToolDeclarations !== "boolean") {
+		throw new Error("config.pinToolDeclarations must be a boolean");
+	}
+	if (config.enableSlashCommands !== undefined && typeof config.enableSlashCommands !== "boolean") {
+		throw new Error("config.enableSlashCommands must be a boolean");
+	}
+	if (config.autoResume !== undefined && typeof config.autoResume !== "boolean") {
+		throw new Error("config.autoResume must be a boolean");
 	}
 	validateMissionStoreConfig(config.missions);
 	validateAuthorityPolicy(config.authorityPolicy);
 	validatePermissionConfig(config.permissions);
 	validateScheduledRunsConfig(config.scheduledRuns);
+	validateDisabledFeatures(config.disabledFeatures);
 	validateFleetKeybindingsConfig(config.fleetKeybindings);
 	validateArtifactConfig(config.artifactConfig);
 	validateCapacityConfig(config.capacity);
-	validateModelExclusionsConfig(config.modelExclusions);
+	if (config.modelExclusions !== undefined) throw new Error("config.modelExclusions was removed; model failures are no longer persisted or used for automatic switching");
 	validateModelResponseAliases(config.modelResponseAliases);
 	validateMainWindowRendererConfig(config.mainWindowRenderer);
 	validateOrcaProgressTabsConfig(config.orcaProgressTabs);
+	validateRunnerLaunchersConfig(config.runnerLaunchers);
+}
+
+// An invalid value counts as unset; above Node's timer ceiling a timer fires almost at once.
+export function resolveConfigDefaultTimeoutMs(raw: unknown): number | undefined {
+	if (typeof raw !== "number" || !Number.isInteger(raw) || raw <= 0 || raw > 2_147_483_647) return undefined;
+	return raw;
 }
 
 export function getConfigPath(): string {
@@ -217,28 +272,6 @@ export function updateConfig(updater: (config: ExtensionConfig) => ExtensionConf
 	return next;
 }
 
-/**
- * Resolve the default TTL that the process-wide exclusion store should use.
- *
- * @param config Extension configuration after validation.
- * @returns The configured TTL in milliseconds, or the built-in 24-hour default.
- */
-// TEST:test/unit/pi-coding-agent-dir.test.ts[loads and applies model exclusion TTL config]
-export function resolveModelExclusionTTL(config: Pick<ExtensionConfig, "modelExclusions">): number {
-	return config.modelExclusions?.defaultTtlMs ?? DEFAULT_MODEL_EXCLUSION_TTL_MS;
-}
-
-/**
- * Apply the configured exclusion policy to the process-wide model store.
- *
- * @param config Extension configuration after validation.
- * @returns Nothing.
- */
-// TEST:test/unit/pi-coding-agent-dir.test.ts[loads and applies model exclusion TTL config]
-export function applyModelExclusionsConfig(config: Pick<ExtensionConfig, "modelExclusions">): void {
-	setDefaultTTL(resolveModelExclusionTTL(config), { shortenExisting: config.modelExclusions?.defaultTtlMs !== undefined });
-}
-
 export function resolveAsyncByDefault(config: Pick<ExtensionConfig, "asyncByDefault">): boolean {
 	return config.asyncByDefault !== false;
 }
@@ -249,12 +282,9 @@ export function loadConfig(): ExtensionConfig {
 		return readConfigForUpdate(configPath);
 	} catch (error) {
 		if (error instanceof PrunedForkConfigError) throw error;
-		// Explicit route identity, worktree, and checkpoint policies must not be silently
-		// discarded and replaced by the built-in defaults after validation fails.
 		try {
 			const raw = JSON.parse(fs.readFileSync(configPath, "utf-8")) as unknown;
-			if (raw && typeof raw === "object" && !Array.isArray(raw)
-				&& (Object.hasOwn(raw, "worktreeProvider") || Object.hasOwn(raw, "worktreeBranchPrefix") || Object.hasOwn(raw, "modelResponseAliases") || Object.hasOwn(raw, "checkpointBeforeDeadlineMs"))) throw error;
+			if (raw && typeof raw === "object" && !Array.isArray(raw) && [...FAIL_CLOSED_CONFIG_KEYS, ...Object.keys(REMOVED_CONFIG_KEYS)].some((key) => Object.hasOwn(raw, key))) throw error;
 		} catch (readError) {
 			if (readError === error) throw error;
 		}

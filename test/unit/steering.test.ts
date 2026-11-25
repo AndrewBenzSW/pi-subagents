@@ -84,6 +84,16 @@ describe("steering lifecycle ledger", () => {
 		assert.deepEqual(partial?.targets.map((target) => target.state), ["delivered", "failed"]);
 	});
 
+	it("keeps a rejection when a failed target's reason is updated", () => {
+		const status = createSteeringStatus();
+		recordSteeringRequest(status, { id: "rejected", requestedAt: 1, message: "stop", targets: [{ index: 0, state: "routed" }] });
+		updateSteeringTarget(status, "rejected", 0, "failed", 2, { reason: "closed", failureKind: "rejected" });
+		updateSteeringTarget(status, "rejected", 0, "failed", 3, { reason: "recovery refused" });
+		const result = actionResultFromSteeringStatus(status, "run", "rejected");
+		assert.equal(result?.targets[0]?.failureKind, "rejected");
+		assert.equal(result?.targets[0]?.reason, "recovery refused");
+	});
+
 	it("classifies terminal mixed outcomes regardless of acknowledgment order", () => {
 		for (const order of [["failed", "delivered"], ["delivered", "failed"]] as const) {
 			const status = createSteeringStatus();
@@ -161,7 +171,6 @@ describe("steering lifecycle ledger", () => {
 			name: "worker",
 			description: "current",
 			model: "current/model",
-			fallbackModels: ["current/fallback"],
 			thinking: "high",
 			tools: ["write"],
 			allowNestedSubagents: true,
@@ -175,7 +184,6 @@ describe("steering lifecycle ledger", () => {
 			skills: ["current-skill"],
 			skillPath: ["current-skill-path"],
 			filePath: "/current/agent.md",
-			completionGuard: true,
 			memory: { scope: "user", path: "/current/memory.md" },
 			output: "/current/output.md",
 			toolBudget: { hard: 99, block: "*" },
@@ -205,7 +213,7 @@ describe("steering lifecycle ledger", () => {
 		assert.equal(recovered.inheritProjectContext, false);
 		assert.deepEqual(recovered.toolBudget, { hard: 7, block: ["read"] });
 		assert.equal(recovered.maxSubagentDepth, 2);
-		for (const field of ["fallbackModels", "extensions", "subagentOnlyExtensions", "mcpDirectTools", "skills", "skillPath", "filePath", "completionGuard", "memory", "output"] as const) {
+		for (const field of ["extensions", "subagentOnlyExtensions", "mcpDirectTools", "skills", "skillPath", "filePath", "memory", "output"] as const) {
 			assert.equal(recovered[field], undefined, `${field} leaked from current config`);
 		}
 	});

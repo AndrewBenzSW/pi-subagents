@@ -5,91 +5,92 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { buildTimeoutRecoverySummary, collectTrackedMutationEvidence, snapshotTrackedMutations } from "../../src/runs/shared/mutation-evidence.ts";
-import { evaluateCompletionMutationGuard } from "../../src/runs/shared/completion-guard.ts";
 
 function git(cwd: string, args: string[]): void {
 	execFileSync("git", args, { cwd, stdio: "ignore" });
 }
 
-function withRepo(run: (repo: string) => void): void {
+function withRepo(run: (repo: string) => void | Promise<void>): Promise<void> {
 	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-mutation-evidence-"));
-	try {
-		git(repo, ["init"]);
-		git(repo, ["config", "user.email", "test@example.com"]);
-		git(repo, ["config", "user.name", "Test User"]);
-		fs.writeFileSync(path.join(repo, "tracked.txt"), "base\n", "utf-8");
-		git(repo, ["add", "tracked.txt"]);
-		git(repo, ["commit", "-m", "base"]);
-		run(repo);
-	} finally {
-		fs.rmSync(repo, { recursive: true, force: true });
-	}
+	return (async () => {
+		try {
+			git(repo, ["init"]);
+			git(repo, ["config", "user.email", "test@example.com"]);
+			git(repo, ["config", "user.name", "Test User"]);
+			fs.writeFileSync(path.join(repo, "tracked.txt"), "base\n", "utf-8");
+			git(repo, ["add", "tracked.txt"]);
+			git(repo, ["commit", "-m", "base"]);
+			await run(repo);
+		} finally {
+			fs.rmSync(repo, { recursive: true, force: true });
+		}
+	})();
 }
 
 describe("tracked mutation evidence", () => {
-	it("detects edits to a tracked file that was already dirty at child start", () => {
-		withRepo((repo) => {
+	it("detects edits to a tracked file that was already dirty at child start", async () => {
+		await withRepo(async (repo) => {
 			fs.writeFileSync(path.join(repo, "tracked.txt"), "dirty before child\n", "utf-8");
 			const snapshot = snapshotTrackedMutations(repo);
 
 			fs.writeFileSync(path.join(repo, "tracked.txt"), "dirty after child\n", "utf-8");
 			fs.writeFileSync(path.join(repo, "untracked.txt"), "ignored by evidence\n", "utf-8");
-			const evidence = collectTrackedMutationEvidence(snapshot, repo);
+			const evidence = await collectTrackedMutationEvidence(snapshot, repo);
 
 			assert.equal(evidence.attemptedMutation, true);
 			assert.deepEqual(evidence.changedFiles, ["tracked.txt"]);
 		});
 	});
 
-	it("detects a child reverting a tracked file that was dirty at child start", () => {
-		withRepo((repo) => {
+	it("detects a child reverting a tracked file that was dirty at child start", async () => {
+		await withRepo(async (repo) => {
 			fs.writeFileSync(path.join(repo, "tracked.txt"), "dirty before child\n", "utf-8");
 			const snapshot = snapshotTrackedMutations(repo);
 
 			fs.writeFileSync(path.join(repo, "tracked.txt"), "base\n", "utf-8");
-			const evidence = collectTrackedMutationEvidence(snapshot, repo);
+			const evidence = await collectTrackedMutationEvidence(snapshot, repo);
 
 			assert.equal(evidence.attemptedMutation, true);
 			assert.deepEqual(evidence.changedFiles, ["tracked.txt"]);
 		});
 	});
 
-	it("detects staged edits to a tracked file that was already staged dirty at child start", () => {
-		withRepo((repo) => {
+	it("detects staged edits to a tracked file that was already staged dirty at child start", async () => {
+		await withRepo(async (repo) => {
 			fs.writeFileSync(path.join(repo, "tracked.txt"), "staged before child\n", "utf-8");
 			git(repo, ["add", "tracked.txt"]);
 			const snapshot = snapshotTrackedMutations(repo);
 
 			fs.writeFileSync(path.join(repo, "tracked.txt"), "staged after child\n", "utf-8");
 			git(repo, ["add", "tracked.txt"]);
-			const evidence = collectTrackedMutationEvidence(snapshot, repo);
+			const evidence = await collectTrackedMutationEvidence(snapshot, repo);
 
 			assert.equal(evidence.attemptedMutation, true);
 			assert.deepEqual(evidence.changedFiles, ["tracked.txt"]);
 		});
 	});
 
-	it("distinguishes unchanged and changed tracked diffs that exceed the fast buffer", () => {
-		withRepo((repo) => {
+	it("distinguishes unchanged and changed tracked diffs that exceed the fast buffer", async () => {
+		await withRepo(async (repo) => {
 			const largeBefore = `${"before\n".repeat(180_000)}before-tail\n`;
 			const largeAfter = `${"after\n".repeat(180_000)}after-tail\n`;
 			fs.writeFileSync(path.join(repo, "tracked.txt"), largeBefore, "utf-8");
 			const snapshot = snapshotTrackedMutations(repo);
-			const unchangedEvidence = collectTrackedMutationEvidence(snapshot, repo);
+			const unchangedEvidence = await collectTrackedMutationEvidence(snapshot, repo);
 
 			assert.equal(unchangedEvidence.attemptedMutation, false);
 			assert.deepEqual(unchangedEvidence.changedFiles, []);
 
 			fs.writeFileSync(path.join(repo, "tracked.txt"), largeAfter, "utf-8");
-			const evidence = collectTrackedMutationEvidence(snapshot, repo);
+			const evidence = await collectTrackedMutationEvidence(snapshot, repo);
 
 			assert.equal(evidence.attemptedMutation, true);
 			assert.deepEqual(evidence.changedFiles, ["tracked.txt"]);
 		});
 	});
 
-	it("does not invoke repository fsmonitor while collecting mutation evidence", () => {
-		withRepo((repo) => {
+	it("does not invoke repository fsmonitor while collecting mutation evidence", async () => {
+		await withRepo(async (repo) => {
 			const marker = path.join(repo, "fsmonitor-invoked");
 			const hook = path.join(repo, "fsmonitor-hook.cjs");
 			fs.writeFileSync(hook, `require("node:fs").appendFileSync(${JSON.stringify(marker)}, "invoked\\n");\n`, "utf-8");
@@ -101,7 +102,7 @@ describe("tracked mutation evidence", () => {
 
 			const snapshot = snapshotTrackedMutations(repo);
 			fs.writeFileSync(path.join(repo, "tracked.txt"), "dirty after child\n", "utf-8");
-			const evidence = collectTrackedMutationEvidence(snapshot, repo);
+			const evidence = await collectTrackedMutationEvidence(snapshot, repo);
 
 			assert.equal(snapshot.unavailable, undefined);
 			assert.equal(evidence.attemptedMutation, true);
@@ -109,23 +110,19 @@ describe("tracked mutation evidence", () => {
 		});
 	});
 
-	it("uses tracked evidence as completion guard mutation proof", () => {
-		const guard = evaluateCompletionMutationGuard({
-			agent: "worker",
-			task: "Implement the requested fix.",
-			messages: [{ role: "assistant", content: [{ type: "text", text: "Implemented." }] }],
-			tools: ["edit"],
-			mutationEvidence: {
-				source: "tracked-files",
-				trackedOnly: true,
-				changedFiles: ["tracked.txt"],
-				attemptedMutation: true,
-			},
-		});
+	it("reports a cwd outside Git in one line instead of git's usage text", async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-mutation-evidence-nogit-"));
+		try {
+			const snapshot = snapshotTrackedMutations(dir);
+			const evidence = await collectTrackedMutationEvidence(snapshot, dir);
+			const summary = buildTimeoutRecoverySummary({ termination: "timed-out", evidence });
 
-		assert.equal(guard.expectedMutation, true);
-		assert.equal(guard.attemptedMutation, true);
-		assert.equal(guard.triggered, false);
+			assert.equal(snapshot.unavailable, "not a Git work tree");
+			assert.match(summary.message, /changed tracked files: unavailable \(not a Git work tree\)/);
+			assert.doesNotMatch(summary.message, /usage: git diff/);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
 	});
 
 	it("formats bounded timeout recovery data", () => {

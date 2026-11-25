@@ -6,6 +6,7 @@ import { formatControlNoticeMessage } from "../shared/subagent-control.ts";
 import {
 	type AsyncJobState,
 	type AsyncStartedEvent,
+	type AsyncWidgetLayout,
 	type ControlEvent,
 	type SteeringNotice,
 	type SubagentChildStatusEvent,
@@ -14,20 +15,26 @@ import {
 	SUBAGENT_CHILD_STATUS_EVENT,
 	SUBAGENT_CONTROL_EVENT,
 	SUBAGENT_CONTROL_INTERCOM_EVENT,
+	SUBAGENT_JOBS_CHANGED_EVENT,
 	SUBAGENT_STEERING_NOTICE_EVENT,
 	WIDGET_ANIMATION_INTERVAL_MS,
 } from "../../shared/types.ts";
-import { readStatus, resolveWatchPath } from "../../shared/utils.ts";
+import { isStatusAccessError, readStatus, resolveWatchPath } from "../../shared/utils.ts";
 import { normalizeParallelGroups } from "./parallel-groups.ts";
 import { reconcileAsyncRun, reconcileNestedAsyncDescendants } from "./stale-run-reconciler.ts";
-import { findNestedRouteForRootId, hasLiveNestedDescendants, updateAsyncJobNestedProjection } from "../shared/nested-events.ts";
-import { listAsyncRuns, type AsyncRunSummary } from "./async-status.ts";
-import { EXTERNAL_JOB_BRIDGE_REQUEST_DIR, serviceExternalJobBridgeRequests } from "../shared/external-job-bridge.ts";
+import { findNestedRouteForRootId, hasLiveNestedDescendants, retainNestedLookupRoute, updateAsyncJobNestedProjection } from "../shared/nested-events.ts";
+import { listAsyncRuns, summarizeAsyncStatus, type AsyncRunSummary } from "./async-status.ts";
+import type { RawDrainStatusObserver } from "../shared/readonly-drain-observation.ts";
+import { EXTERNAL_JOB_BRIDGE_REQUEST_DIR, externalJobBridgeEligibility, serviceExternalJobBridgeRequests } from "../shared/external-job-bridge.ts";
 import { shouldUseNativeFsWatch } from "../../shared/watch-strategy.ts";
 import { parseWorkflowChildSummary } from "../../workflows/workflow-child-summary.ts";
+import { withWorkflowChildRunModel } from "./workflow-terminal-proof.ts";
 import { validHostStepNodes } from "../shared/host-step-status.ts";
 import { readProcessTerminal } from "./process-terminal.ts";
 import { withCachedUiContext } from "../../shared/extension-context.ts";
+import { OWNING_SESSION_COMPLETION_OWNER } from "../../shared/completion-owner.ts";
+import type { ResultDeliveryOwnership } from "./result-delivery-ownership.ts";
+import { ownerSessionIds } from "../shared/run-ownership.ts";
 
 interface AsyncJobTrackerOptions {
 	completionRetentionMs?: number;
@@ -35,13 +42,20 @@ interface AsyncJobTrackerOptions {
 	pollIntervalMs?: number;
 	resultsDir?: string;
 	widgetEnabled?: boolean;
+	widgetCollapsed?: boolean;
+	widgetLayout?: AsyncWidgetLayout;
 	platform?: NodeJS.Platform;
-	onJobTerminal?: () => void;
+	onJobTerminal?: (job: AsyncJobState) => void;
+	onJobCleanup?: (asyncId: string) => void;
+	/** Lets a run whose launching Pi exited hold its publication in the session that owns it. */
+	deliveryOwnerId?: ResultDeliveryOwnership["deliveryOwnerId"];
 	watch?: typeof fs.watch;
 	kill?: (pid: number, signal?: NodeJS.Signals | 0) => boolean;
 	now?: () => number;
 	/** Resolve native supervisor requests without scanning supervisor mailboxes. */
 	supervisorRequestState?: (event: ControlEvent) => "pending" | "resolved" | "unknown";
+	/** Called whenever the tracked jobs changed enough to re-render the widget. */
+	onJobsChanged?: () => void;
 }
 
 const CONTROL_EVENT_READ_CHUNK_BYTES = 64 * 1024;
@@ -51,6 +65,11 @@ const MAX_RECENT_FLEET_JOBS = 20;
 const DEFAULT_LIVENESS_INTERVAL_MS = 5000;
 const EVENT_REFRESH_DEBOUNCE_MS = 25;
 const WATCH_ATTACHMENT_RETRY_MS = 100;
+/** A native supervisor request is already its own parent turn; its attention notice only escalates an unanswered one. */
+const SUPERVISOR_NOTICE_GRACE_MS = 60_000;
+
+type ControlRecord = { event: ControlEvent; channels: string[]; childIntercomTarget?: string; noticeText?: string; intercom?: { to?: string; message?: string } };
+type ControlPayload = { event: ControlEvent; source: "async"; asyncDir: string; childIntercomTarget?: string; noticeText: string };
 
 const isTerminalJobStatus = (status: AsyncJobState["status"]): boolean =>
 	status === "complete" || status === "failed" || status === "partial" || status === "paused" || status === "rejected" || status === "stopped";
@@ -70,7 +89,8 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 	handleStarted: (data: unknown) => void;
 	handleComplete: (data: unknown) => void;
 	resetJobs: (ctx?: ExtensionContext) => void;
-	restoreActiveJobs: (ctx?: ExtensionContext) => void;
+	/** `observeStatus` also sees the statuses of other sessions' runs that the listing skips. */
+	restoreActiveJobs: (ctx?: ExtensionContext, observeStatus?: RawDrainStatusObserver) => void;
 	dispose: () => void;
 } {
 	const completionRetentionMs = options.completionRetentionMs ?? 10000;
@@ -85,19 +105,13 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 	// Early native failure is visible before its publisher finishes. Retain only
 	// that scoped observation, using the existing liveness sweep to renew delivery.
 	const terminalPublications = new Map<string, { instanceId: string; pending: true } | { pending: false }>();
-	const externalJobBridgeEligibility = (steps: AsyncJobState["steps"]): "required" | "not-required" | "unknown" => {
-		if (!Array.isArray(steps)) return "unknown";
-		for (const step of steps) {
-			const runner = (step as { runner?: unknown } | null)?.runner;
-			if (runner === undefined) continue;
-			if (!runner || typeof runner !== "object" || Array.isArray(runner)) return "unknown";
-			const runnerType = (runner as { type?: unknown }).type;
-			if (typeof runnerType !== "string") return "unknown";
-			if (runnerType === "external-job") return "required";
-			if (runnerType !== "pi" && runnerType !== "external-cli") return "unknown";
-		}
-		return "not-required";
-	};
+	// Runs whose status.json this process may not read. An unreadable file says nothing about the
+	// runner, so the job keeps its last known state rather than reading as finished (#3295).
+	const unreadableStatusRuns = new Set<string>();
+	// Restored runs whose status.json was unreadable, so their owner is unknown. Each is counted as
+	// this session's until a read shows otherwise; nothing writes to it before then.
+	const unverifiedRuns = new Set<string>();
+	const supervisorNoticeTimers = new Map<string, { asyncId: string; timer: ReturnType<typeof setTimeout> }>();
 	let rootWatcher: fs.FSWatcher | undefined;
 	let nextLivenessAt = Date.now() + livenessIntervalMs;
 	let nextWidgetAnimationAt = Date.now() + WIDGET_ANIMATION_INTERVAL_MS;
@@ -110,8 +124,10 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		}, run);
 	};
 	const rerenderWidget = (ctx: ExtensionContext, jobs = Array.from(state.asyncJobs.values())) => {
+		options.onJobsChanged?.();
+		pi.events.emit(SUBAGENT_JOBS_CHANGED_EVENT, { version: 1 });
 		if (state.widgetsSuspended) return;
-		renderWidget(ctx, options.widgetEnabled === false ? [] : jobs);
+		renderWidget(ctx, options.widgetEnabled === false ? [] : jobs, options.widgetCollapsed, options.widgetLayout);
 		(ctx.ui as { requestRender?: () => void }).requestRender?.();
 	};
 	const rerenderLastWidget = (jobs = Array.from(state.asyncJobs.values())) => {
@@ -131,7 +147,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			if (state.widgetsSuspended) return;
 			const requestRender = (ctx.ui as { requestRender?: () => void }).requestRender;
 			if (requestRender) requestRender.call(ctx.ui);
-			else renderWidget(ctx, Array.from(state.asyncJobs.values()));
+			else renderWidget(ctx, Array.from(state.asyncJobs.values()), options.widgetCollapsed, options.widgetLayout);
 		});
 	};
 	const refreshWidget = (ctx: ExtensionContext) => rerenderWidget(ctx);
@@ -223,10 +239,53 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		const timer = setTimeout(() => {
 			state.cleanupTimers.delete(asyncId);
 			closeJobWatcher(asyncId);
+			const job = state.asyncJobs.get(asyncId);
+			retainNestedLookupRoute(state, job?.nestedRoute, job?.sessionId);
 			state.asyncJobs.delete(asyncId);
+			options.onJobCleanup?.(asyncId);
 			rerenderLastWidget();
 		}, completionRetentionMs);
 		state.cleanupTimers.set(asyncId, timer);
+	};
+	const deliverControlRecord = (record: ControlRecord, payload: ControlPayload) => {
+		if (record.channels.includes("event")) {
+			pi.events.emit(SUBAGENT_CONTROL_EVENT, payload);
+		}
+		if (record.event.type !== "active_long_running" && record.channels.includes("intercom") && record.intercom?.to && record.intercom.message) {
+			pi.events.emit(SUBAGENT_CONTROL_INTERCOM_EVENT, {
+				...payload,
+				to: record.intercom.to,
+				message: record.intercom.message,
+			});
+		}
+	};
+	const readSupervisorRequestState = (event: ControlEvent, asyncDir: string): "pending" | "resolved" | "unknown" => {
+		try {
+			return options.supervisorRequestState?.(event) ?? "unknown";
+		} catch (error) {
+			console.error(`Failed to resolve supervisor request state for async control event in '${asyncDir}':`, error);
+			return "unknown";
+		}
+	};
+	const scheduleSupervisorNotice = (asyncId: string, record: ControlRecord, payload: ControlPayload) => {
+		const key = `${asyncId}:${record.event.index}:${record.event.toolCallId}`;
+		if (supervisorNoticeTimers.has(key)) return;
+		const timer = setTimeout(() => {
+			supervisorNoticeTimers.delete(key);
+			const job = state.asyncJobs.get(asyncId);
+			if (job?.status !== "running" && job?.status !== "queued") return;
+			if (readSupervisorRequestState(record.event, payload.asyncDir) === "resolved") return;
+			deliverControlRecord(record, payload);
+		}, SUPERVISOR_NOTICE_GRACE_MS);
+		timer.unref?.();
+		supervisorNoticeTimers.set(key, { asyncId, timer });
+	};
+	const clearSupervisorNotices = (asyncId?: string) => {
+		for (const [key, entry] of supervisorNoticeTimers) {
+			if (asyncId !== undefined && entry.asyncId !== asyncId) continue;
+			clearTimeout(entry.timer);
+			supervisorNoticeTimers.delete(key);
+		}
 	};
 	const emitNewControlEvents = (job: AsyncJobState) => {
 		const eventsPath = path.join(job.asyncDir, "events.jsonl");
@@ -262,24 +321,28 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				if (!parsed || typeof parsed !== "object") return;
 				if ((parsed as { type?: unknown }).type === "subagent.child-status") {
 					const event = parsed as Partial<SubagentChildStatusEvent>;
-					if (event.version !== 1 || typeof event.runId !== "string" || typeof event.childId !== "string" || (event.status !== "stopping" && event.status !== "stopped") || typeof event.ts !== "number") return;
-					pi.events.emit(SUBAGENT_CHILD_STATUS_EVENT, {
-						type: "subagent.child-status",
-						version: 1,
-						runId: event.runId,
-						childId: event.childId,
-						status: event.status,
-						ts: event.ts,
-						...(typeof event.reason === "string" ? { reason: event.reason } : {}),
-						source: event.source === "rpc" ? "rpc" : "async",
-						asyncDir: job.asyncDir,
-						...(typeof event.stepIndex === "number" ? { stepIndex: event.stepIndex } : {}),
-						...(typeof event.agent === "string" ? { agent: event.agent } : {}),
-						...(typeof event.childRunId === "string" ? { childRunId: event.childRunId } : {}),
-						...(typeof event.workflowKey === "string" ? { workflowKey: event.workflowKey } : {}),
-						...(typeof event.phase === "string" ? { phase: event.phase } : {}),
-						...(typeof event.label === "string" ? { label: event.label } : {}),
-					} satisfies SubagentChildStatusEvent);
+					if (event.version !== 1 || typeof event.runId !== "string" || typeof event.childId !== "string" || (event.status !== "started" && event.status !== "stopping" && event.status !== "stopped") || typeof event.ts !== "number") return;
+					try {
+						pi.events.emit(SUBAGENT_CHILD_STATUS_EVENT, {
+							type: "subagent.child-status",
+							version: 1,
+							runId: event.runId,
+							childId: event.childId,
+							status: event.status,
+							ts: event.ts,
+							...(typeof event.reason === "string" ? { reason: event.reason } : {}),
+							source: event.source === "rpc" ? "rpc" : "async",
+							asyncDir: job.asyncDir,
+							...(typeof event.stepIndex === "number" ? { stepIndex: event.stepIndex } : {}),
+							...(typeof event.agent === "string" ? { agent: event.agent } : {}),
+							...(typeof event.childRunId === "string" ? { childRunId: event.childRunId } : {}),
+							...(typeof event.workflowKey === "string" ? { workflowKey: event.workflowKey } : {}),
+							...(typeof event.phase === "string" ? { phase: event.phase } : {}),
+							...(typeof event.label === "string" ? { label: event.label } : {}),
+						} satisfies SubagentChildStatusEvent);
+					} catch (error) {
+						console.error("Failed to emit async child status event:", error);
+					}
 					return;
 				}
 				if ((parsed as { type?: unknown }).type === "subagent.steering.notice") {
@@ -299,34 +362,27 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 					return;
 				}
 				if ((parsed as { type?: unknown }).type !== "subagent.control") return;
-				const record = parsed as { event?: ControlEvent; channels?: string[]; childIntercomTarget?: string; noticeText?: string; intercom?: { to?: string; message?: string } };
-				if (!record.event || !Array.isArray(record.channels)) return;
-				if (record.event.type === "needs_attention" && record.event.reason === "supervisor_request" && options.supervisorRequestState) {
-					let requestState: "pending" | "resolved" | "unknown" = "unknown";
-					try {
-						requestState = options.supervisorRequestState(record.event);
-					} catch (error) {
-						console.error(`Failed to resolve supervisor request state for async control event in '${job.asyncDir}':`, error);
-					}
-					if (requestState === "resolved") return;
-				}
-				const payload = {
+				const candidate = parsed as Partial<ControlRecord>;
+				if (!candidate.event || !Array.isArray(candidate.channels)) return;
+				// SAFETY: event is present and channels is an array; every other ControlRecord field is optional.
+				const record = candidate as ControlRecord;
+				const supervisorRequest = record.event.type === "needs_attention" && record.event.reason === "supervisor_request" && options.supervisorRequestState !== undefined;
+				if (supervisorRequest && readSupervisorRequestState(record.event, job.asyncDir) === "resolved") return;
+				const payload: ControlPayload = {
 					event: record.event,
-					source: "async" as const,
+					source: "async",
 					asyncDir: job.asyncDir,
 					childIntercomTarget: record.childIntercomTarget,
 					noticeText: record.noticeText ?? formatControlNoticeMessage(record.event, record.childIntercomTarget),
 				};
-				if (record.channels.includes("event")) {
-					pi.events.emit(SUBAGENT_CONTROL_EVENT, payload);
+				// External intercom asks have no native lifecycle to re-check, so they keep the immediate notice.
+				if (supervisorRequest && record.event.currentTool !== "intercom") {
+					// Status and waits still react now; the parent notice and intercom copy wait for the grace period.
+					if (record.channels.includes("event")) pi.events.emit(SUBAGENT_CONTROL_EVENT, { ...payload, noticeDeferred: true });
+					scheduleSupervisorNotice(job.asyncId, record, payload);
+					return;
 				}
-				if (record.event.type !== "active_long_running" && record.channels.includes("intercom") && record.intercom?.to && record.intercom.message) {
-					pi.events.emit(SUBAGENT_CONTROL_INTERCOM_EVENT, {
-						...payload,
-						to: record.intercom.to,
-						message: record.intercom.message,
-					});
-				}
+				deliverControlRecord(record, payload);
 			};
 			let readCursor = cursor;
 			let lastCompleteCursor = cursor;
@@ -387,9 +443,50 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		runningJobIds.delete(asyncId);
 		externalJobBridgeRuns.delete(asyncId);
 		terminalPublications.delete(asyncId);
+		unreadableStatusRuns.delete(asyncId);
+		unverifiedRuns.delete(asyncId);
+		clearSupervisorNotices(asyncId);
+	};
+	const forgetJob = (asyncId: string) => {
+		cancelCleanup(asyncId);
+		closeJobWatcher(asyncId);
+		state.asyncJobs.delete(asyncId);
+		state.fleetJobs?.delete(asyncId);
+		options.onJobCleanup?.(asyncId);
 	};
 
 	const refreshJob = (job: AsyncJobState): boolean => {
+		if (unverifiedRuns.has(job.asyncId)) {
+			let stored: ReturnType<typeof readStatus> = null;
+			let summary: AsyncRunSummary | undefined;
+			try {
+				stored = readStatus(job.asyncDir);
+				if (stored) summary = summarizeAsyncStatus(job.asyncDir, stored);
+			} catch (error) {
+				if (isStatusAccessError(error, job.asyncDir)) return false;
+				console.error(`[pi-subagents] Dropping restored async run '${job.asyncId}' at '${path.join(job.asyncDir, "status.json")}': ${error instanceof Error ? error.message : String(error)}.`);
+			}
+			const owners = state.currentSessionId ? ownerSessionIds(state.currentSessionId) : undefined;
+			if (!stored || !summary || (owners && !owners.has(stored.sessionId))) {
+				forgetJob(job.asyncId);
+				return true;
+			}
+			let restored: AsyncJobState;
+			try {
+				restored = summaryToJob(summary);
+			} catch (error) {
+				if (!unreadableStatusRuns.has(job.asyncId)) {
+					unreadableStatusRuns.add(job.asyncId);
+					console.error(`Cannot read async control events for '${job.asyncDir}'; keeping it as running until they are readable:`, error);
+				}
+				return false;
+			}
+			// Become the job a normal restore would have made, but keep the placeholder's state so the
+			// refresh below sees any transition, and its cursor when restore could read events.jsonl.
+			Object.assign(job, restored, { status: job.status, controlEventCursor: job.controlEventCursor ?? restored.controlEventCursor });
+			rememberFleetJob(state, job);
+			unverifiedRuns.delete(job.asyncId);
+		}
 		const widgetExpanded = withLastUiContext((ctx) => ctx.ui.getToolsExpanded?.() ?? false) ?? false;
 		const widgetStateBefore = widgetRenderKey(job, widgetExpanded);
 		let nestedRefreshFailed = false;
@@ -435,6 +532,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				},
 			});
 			const status = reconciliation.status ?? readStatus(job.asyncDir);
+			unreadableStatusRuns.delete(job.asyncId);
 			if (!bridgeAlreadyRequired) {
 				const bridgeEligibility = externalJobBridgeEligibility(status?.steps);
 				if (bridgeEligibility === "required") externalJobBridgeRuns.add(job.asyncId);
@@ -468,6 +566,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				if (status.mode === "workflow") job.workflowGraph = status.workflowGraph ?? job.workflowGraph;
 				job.hostSteps = validHostStepNodes(status.workflowGraph);
 				const workflowChildren = parseWorkflowChildSummary(status.workflowChildren);
+				if (workflowChildren && status.mode === "workflow") workflowChildren.children = workflowChildren.children.map((child) => withWorkflowChildRunModel(job.asyncDir, child));
 				if (workflowChildren && workflowChildren.workflowRunId !== status.runId) throw new Error("workflowChildren.workflowRunId does not match async status runId.");
 				job.workflowChildren = workflowChildren ?? job.workflowChildren;
 				job.currentStep = status.currentStep ?? job.currentStep;
@@ -485,6 +584,9 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 						? status.steps.slice(activeGroup.start, activeGroup.start + activeGroup.count).map((step, index) => ({ ...step, index: activeGroup.start + index }))
 						: status.steps.map((step, index) => ({ ...step, index }));
 					job.activeParallelGroup = Boolean(activeGroup);
+					if (status.mode === "workflow") {
+						for (const step of visibleSteps) if (step.async === true) Object.assign(step, withWorkflowChildRunModel(job.asyncDir, step));
+					}
 					job.agents = visibleSteps.map((step) => step.agent);
 					job.steps = visibleSteps;
 					refreshNestedProjection();
@@ -507,8 +609,11 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				if (isTerminalJobStatus(job.status)) {
 					let publication = terminalPublications.get(job.asyncId);
 					if (!publication && status.mode !== "workflow" && status.processTerminal?.state === "pending"
-						&& status.runId === job.asyncId && status.sessionId === state.currentSessionId
-						&& status.completionOwnerId && status.completionOwnerId === state.completionOwnerId) {
+						&& status.runId === job.asyncId && status.completionOwnerId
+						&& ((status.sessionId === state.currentSessionId && status.completionOwnerId === state.completionOwnerId)
+							// Also covers a session inherited after /new or /resume: deliveryOwnerId checks run ownership.
+							|| (typeof status.sessionId === "string"
+								&& options.deliveryOwnerId?.(status.sessionId, status.completionOwnerId, status.completionOwnerProcess, status.parentWorkflowRunId) === OWNING_SESSION_COMPLETION_OWNER))) {
 						publication = { instanceId: status.processTerminal.runnerProcessInstanceId, pending: true };
 						terminalPublications.set(job.asyncId, publication);
 					}
@@ -526,7 +631,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 						} else cancelCleanup(job.asyncId);
 					}
 					// Scan on close too: publication may have raced the payload check.
-					if (!isTerminalJobStatus(previousStatus) || (wasPending && !publication?.pending)) options.onJobTerminal?.();
+					if (!isTerminalJobStatus(previousStatus) || (wasPending && !publication?.pending)) options.onJobTerminal?.(job);
 					rememberFleetJob(state, job);
 					if (!publication?.pending && !nestedRefreshFailed && !hasLiveNestedDescendants(job.nestedChildren) && (previousStatus !== job.status || !state.cleanupTimers.has(job.asyncId))) {
 						scheduleCleanup(job.asyncId);
@@ -547,6 +652,13 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				} catch (bridgeError) {
 					console.error(`Failed to service external job bridge for '${job.asyncDir}':`, bridgeError);
 				}
+			}
+			if (isStatusAccessError(error, job.asyncDir)) {
+				if (!unreadableStatusRuns.has(job.asyncId)) {
+					unreadableStatusRuns.add(job.asyncId);
+					console.error(`Cannot read async status for '${job.asyncDir}'; keeping its last known state until it is readable:`, error);
+				}
+				return widgetRenderKey(job, widgetExpanded) !== widgetStateBefore;
 			}
 			if (job.status !== "failed") {
 				console.error(`Failed to read async status for '${job.asyncDir}':`, error);
@@ -667,7 +779,14 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			if (now >= nextLivenessAt) {
 				nextLivenessAt = now + livenessIntervalMs;
 				let widgetChanged = false;
+				// A session reopened in this process takes its runs back from the session that replaced it.
+				const owners = state.currentSessionId ? ownerSessionIds(state.currentSessionId) : undefined;
 				for (const job of state.asyncJobs.values()) {
+					if (owners && job.sessionId !== undefined && !owners.has(job.sessionId)) {
+						forgetJob(job.asyncId);
+						widgetChanged = true;
+						continue;
+					}
 					watchJob(job);
 					if (refreshJob(job)) widgetChanged = true;
 				}
@@ -694,7 +813,8 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		const agents = firstGroupCount && firstGroupCount > 0
 			? rawAgents?.slice(0, firstGroupCount)
 			: rawAgents;
-		const sessionRoot = state.liveAsyncSessionRoots?.get(info.id);
+		const existingJob = state.asyncJobs.get(info.id);
+		const sessionRoot = state.liveAsyncSessionRoots?.get(info.id) ?? existingJob?.sessionRoot;
 		state.liveAsyncSessionRoots?.delete(info.id);
 		externalJobBridgeRuns.delete(info.id);
 		terminalPublications.delete(info.id);
@@ -779,6 +899,9 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		runningJobIds.clear();
 		externalJobBridgeRuns.clear();
 		terminalPublications.clear();
+		unreadableStatusRuns.clear();
+		unverifiedRuns.clear();
+		clearSupervisorNotices();
 	};
 
 	const resetJobs = (ctx?: ExtensionContext) => {
@@ -798,13 +921,18 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		}
 	};
 
-	const restoreActiveJobs = (ctx?: ExtensionContext) => {
+	const restoreActiveJobs = (ctx?: ExtensionContext, observeStatus?: RawDrainStatusObserver) => {
 		if (ctx?.hasUI) state.lastUiContext = ctx;
 		state.statusProjectionSessionId = null;
 		if (!state.currentSessionId) return;
 		let runs: AsyncRunSummary[];
+		const unreadable: Array<{ runId: string; asyncDir: string }> = [];
 		try {
-			runs = listAsyncRuns(asyncDirRoot, { states: ["queued", "running"], sessionId: state.currentSessionId, resultsDir, kill: options.kill, now: options.now });
+			// A workflow whose Pi exited is repaired here, in the session that owns it, which then delivers its notice.
+			runs = listAsyncRuns(asyncDirRoot, {
+				states: ["queued", "running"], sessionId: state.currentSessionId, resultsDir, kill: options.kill, now: options.now, adoptCompletionOwnerId: state.completionOwnerId,
+				onUnreadableActiveRun: (runId, asyncDir) => unreadable.push({ runId, asyncDir }),
+			}, observeStatus);
 		} catch (error) {
 			console.error(`Failed to restore active async jobs from '${asyncDirRoot}':`, error);
 			return;
@@ -816,8 +944,22 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			rememberFleetJob(state, job);
 			watchJob(job);
 		}
+		// An unreadable run may still be working: idle must not be reported until a read settles it.
+		for (const { runId, asyncDir } of unreadable) {
+			if (state.asyncJobs.has(runId)) continue;
+			const job: AsyncJobState = { asyncId: runId, asyncDir, status: "running", sessionId: state.currentSessionId, updatedAt: Date.now() };
+			try {
+				job.controlEventCursor = restoredControlEventCursor(asyncDir);
+			} catch {
+				// An unsearchable run directory: refreshJob reads the cursor once the run is verified.
+			}
+			state.asyncJobs.set(runId, job);
+			runningJobIds.add(runId);
+			unverifiedRuns.add(runId);
+			watchJob(job);
+		}
 		state.statusProjectionSessionId = state.currentSessionId;
-		if (runs.length === 0) return;
+		if (runs.length === 0 && unreadable.length === 0) return;
 		ensurePoller();
 		rerenderLastWidget();
 	};

@@ -48,7 +48,41 @@ export interface SubagentDelegationStarted {
 	nodeId: string;
 }
 
+/**
+ * Cumulative usage for one attempt at one observation time. This snapshot is
+ * emitted only when every counter is known, finite, and non-negative. It does
+ * not combine retries or replace authoritative terminal usage; absence means
+ * unavailable, not zero. UPDATE `tokens` keeps its input-plus-output meaning.
+ */
+export interface SubagentDelegationUpdateUsage {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	turns: number;
+}
+
+/** Observed assistant-request errors and Pi retries, not provider-internal HTTP attempts. */
+export interface SubagentDelegationProviderDiagnostics {
+	errorCount: number;
+	lastError?: {
+		kind: "rate_limited" | "transient_other" | "unknown";
+		/** Fixed safe description; never the raw provider error/body. */
+		message: string;
+		at: number;
+	};
+	retry?: {
+		phase: "backoff" | "in_flight";
+		attempt: number;
+		maxAttempts: number;
+		delayMs: number;
+		/** Observation time of auto_retry_start; delayMs is Pi's planned delay. */
+		scheduledAt: number;
+	};
+}
+
 export interface SubagentDelegationUpdate extends SubagentDelegationStarted {
+	providerDiagnostics?: SubagentDelegationProviderDiagnostics;
 	runId?: string;
 	currentTool?: string;
 	currentToolArgs?: string;
@@ -59,6 +93,7 @@ export interface SubagentDelegationUpdate extends SubagentDelegationStarted {
 	toolCount?: number;
 	durationMs?: number;
 	tokens?: number;
+	usage?: SubagentDelegationUpdateUsage;
 }
 
 export type SubagentDelegationStatus =
@@ -90,6 +125,7 @@ export interface SubagentDelegationUsage {
 }
 
 export interface SubagentDelegationTerminalResponse extends SubagentDelegationStarted {
+	providerDiagnostics?: SubagentDelegationProviderDiagnostics;
 	status: Exclude<SubagentDelegationStatus, "invalid_request">;
 	error?: string;
 	runId?: string;

@@ -7,7 +7,7 @@ import * as path from "node:path";
 import { resolveAuthorityDecision, type AuthorityPolicyConfig } from "../../policy/authority.ts";
 import { PROJECT_SUBAGENTS_RELATIVE_DIR } from "../../shared/artifacts.ts";
 import { getAgentDir } from "../../shared/utils.ts";
-import type { ManagedWorktreeProvider, WorktreeNaming, WorktreeProvider } from "../../shared/types.ts";
+import type { ManagedWorktreeProvider, ParallelHandoffCleanupTask, WorktreeNaming, WorktreeProvider } from "../../shared/types.ts";
 
 export const DEFAULT_WORKTREE_PROVIDER: WorktreeProvider = "auto";
 export const DEFAULT_WORKTREE_BASE_REF = "HEAD";
@@ -20,7 +20,7 @@ const WORKTREE_NAMING_BRANCH_MAX_BYTES = 256;
 const WORKTREE_COMMAND_OUTPUT_MAX_BYTES = 128 * 1024;
 const WORKTRUNK_COMMAND = process.platform === "win32" ? "git" : "wt";
 const WORKTRUNK_ARG_PREFIX = process.platform === "win32" ? ["wt"] : [];
-export const MACHINE_DIFF_OPTIONS = ["--no-color", "--no-ext-diff", "--no-textconv", "--default-prefix", "--line-prefix=", "--no-relative"] as const;
+export const MACHINE_DIFF_OPTIONS = ["--no-color", "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/", "--line-prefix=", "--no-relative"] as const;
 const MACHINE_PATCH_OPTIONS = [...MACHINE_DIFF_OPTIONS, "--binary"] as const;
 const PATCH_VALIDATION_OPTIONS = ["apply", "--check", "--cached", "--reverse", "--binary", "--whitespace=nowarn"] as const;
 
@@ -57,6 +57,8 @@ export interface WorktreeSetup {
 }
 
 export interface WorktreeInfo {
+	/** Canonical parent captured at allocation; never re-resolve this evidence later. */
+	recordedBaseDir?: string;
 	path: string;
 	agentCwd: string;
 	branch: string;
@@ -79,18 +81,7 @@ export interface WorktreeDiff {
 	error?: string;
 }
 
-export interface WorktreeCleanupTask {
-	index: number;
-	path: string;
-	branch: string;
-	provider?: ManagedWorktreeProvider;
-	naming?: WorktreeNaming;
-	worktreeRemoved: boolean;
-	branchRemoved: boolean;
-	preserved?: boolean;
-	reason?: string;
-	errors?: string[];
-}
+export type WorktreeCleanupTask = ParallelHandoffCleanupTask;
 
 export type WorktreeCleanupIntent =
 	| { kind: "preserve"; capturedDiffs?: WorktreeDiff[]; handoffManifestPath?: string; cleanupBlocker?: string }
@@ -293,6 +284,26 @@ function runGitChecked(cwd: string, args: string[]): string {
 	return result.stdout;
 }
 
+export function findListedWorktreeOnBranch(repoCwd: string, branch: string): string | undefined {
+	let current: string | undefined;
+	for (const line of runGitChecked(repoCwd, ["worktree", "list", "--porcelain"]).split("\n")) {
+		if (line.startsWith("worktree ")) current = line.slice("worktree ".length);
+		else if (line === `branch refs/heads/${branch}` && current) return normalizeComparableCwd(current);
+	}
+	return undefined;
+}
+
+export function findListedWorktreeAgentCwd(repoCwd: string, branch: string): string | undefined {
+	const worktree = findListedWorktreeOnBranch(repoCwd, branch);
+	if (!worktree) return undefined;
+	const cwdRelative = resolveRepoCwdRelative(repoCwd);
+	return cwdRelative ? path.join(worktree, cwdRelative) : worktree;
+}
+
+export function isComparablePathInside(parent: string, child: string): boolean {
+	return isPathInside(normalizeComparableCwd(parent), normalizeComparableCwd(child));
+}
+
 /** Validate a captured patch against the worktree index without changing either. */
 export function validateWorktreePatch(worktreePath: string, patchPath: string): string | undefined {
 	const result = runGit(worktreePath, [...PATCH_VALIDATION_OPTIONS, patchPath]);
@@ -349,8 +360,11 @@ async function probeWorktreeSource(tx: Pick<SetupTransaction, "git" | "gitChecke
 	// pi-subagents writes durable runtime state under .pi/subagents/ by default;
 	// that state must not make managed isolation unusable for later runs.
 	const status = await tx.gitChecked(toplevel, ["status", "--porcelain", "--", `:!${PROJECT_SUBAGENTS_RELATIVE_DIR}`]);
-	if (status.trim().length > 0) {
-		throw new Error("worktree isolation requires a clean git working tree. Commit or stash changes first.");
+	const changes = status.split("\n").filter((line) => line.trim().length > 0);
+	if (changes.length > 0) {
+		const shown = changes.slice(0, 10).map((line) => `  ${line}`);
+		if (changes.length > shown.length) shown.push(`  … and ${changes.length - shown.length} more`);
+		throw new Error(`worktree isolation requires a clean git working tree: ${toplevel} has ${changes.length} uncommitted change(s):\n${shown.join("\n")}\nCommit or stash them first.`);
 	}
 	return toplevel;
 }
@@ -439,9 +453,14 @@ function shortWorktreeHash(value: string): string {
 }
 
 function truncateUtf8(value: string, maxBytes: number): string {
-	if (Buffer.byteLength(value, "utf-8") <= maxBytes) return value;
-	const truncated = Buffer.from(value, "utf-8").subarray(0, maxBytes).toString("utf-8");
-	return /[\uD800-\uDFFF]$/u.test(truncated) ? truncated.slice(0, -1) : truncated;
+	const bytes = Buffer.from(value, "utf-8");
+	if (bytes.length <= maxBytes) return value;
+	// Back off to a code-point boundary before decoding: cutting mid-sequence
+	// emits U+FFFD (3 bytes per dangling byte), which can push the re-encoded
+	// result beyond maxBytes (e.g. a 256-byte cap yields a 258-byte string).
+	let end = maxBytes;
+	while (end > 0 && (bytes[end]! & 0xc0) === 0x80) end -= 1;
+	return bytes.subarray(0, end).toString("utf-8");
 }
 
 /** Convert an arbitrary label to a single safe filesystem/branch component. */
@@ -743,13 +762,35 @@ export function resolveExpectedWorktreeAgentCwd(cwd: string, runId: string, inde
 function linkNodeModulesIfPresent(toplevel: string, worktreePath: string): boolean {
 	const nodeModulesPath = path.join(toplevel, "node_modules");
 	const nodeModulesLinkPath = path.join(worktreePath, "node_modules");
-	if (!fs.existsSync(nodeModulesPath) || fs.existsSync(nodeModulesLinkPath)) return false;
+	const hasDirectoryEntry = (candidate: string): boolean => {
+		try { fs.lstatSync(candidate); return true; }
+		catch (error) {
+			if (error instanceof Error && "code" in error && error.code === "ENOENT") return false;
+			throw error;
+		}
+	};
 	try {
-		fs.symlinkSync(nodeModulesPath, nodeModulesLinkPath);
+		if (hasDirectoryEntry(nodeModulesLinkPath)) return false;
+		let sourceRealPath: string;
+		try {
+			if (!fs.statSync(nodeModulesPath).isDirectory()) throw new Error("source node_modules is not a directory");
+			sourceRealPath = fs.realpathSync.native(nodeModulesPath);
+		} catch (error) {
+			if (error instanceof Error && "code" in error && error.code === "ENOENT") return false;
+			throw error;
+		}
+		fs.symlinkSync(nodeModulesPath, nodeModulesLinkPath, process.platform === "win32" ? "junction" : "dir");
+		if (!fs.lstatSync(nodeModulesLinkPath).isSymbolicLink()
+			|| fs.realpathSync.native(nodeModulesLinkPath) !== sourceRealPath) {
+			throw new Error("created link does not resolve to the source node_modules");
+		}
 		return true;
-	} catch {
-		// Symlink creation is optional (e.g., unsupported filesystems on CI runners).
-		return false;
+	} catch (error) {
+		const code = error instanceof Error && "code" in error && typeof error.code === "string" ? `${error.code}: ` : "";
+		throw new Error(
+			`failed to link node_modules from ${nodeModulesPath} to ${nodeModulesLinkPath}: ${code}${error instanceof Error ? error.message : String(error)}`,
+			{ cause: error },
+		);
 	}
 }
 
@@ -918,9 +959,11 @@ async function createNativeWorktree(
 	if (branch.status !== 1 || pathExists) throw new Error(`worktree path or branch already exists: ${worktreePath}, ${naming.requestedBranch}`);
 	tx.attempt(index, naming.requestedBranch, worktreePath);
 	ensureProjectWorktreeDir(dedicatedRoot, toplevel);
+	const recordedBaseDir = normalizeComparableCwd(path.dirname(worktreePath));
 	await tx.git(toplevel, ["worktree", "add", worktreePath, "-b", naming.requestedBranch, baseCommit]);
 	const worktree: WorktreeInfo = {
 		path: worktreePath,
+		recordedBaseDir,
 		agentCwd: worktreePath,
 		branch: naming.requestedBranch,
 		index,
@@ -999,6 +1042,7 @@ async function createWorktrunkWorktree(
 		if (returnedHead !== baseCommit) throw new Error("Worktrunk provisioning returned a worktree at a different base commit");
 		const worktree: WorktreeInfo = {
 			path: worktreePath,
+			recordedBaseDir: normalizeComparableCwd(path.dirname(worktreePath)),
 			agentCwd: cwdRelative ? path.join(worktreePath, cwdRelative) : worktreePath,
 			branch: naming.requestedBranch,
 			index,
@@ -1155,6 +1199,7 @@ function cleanupSingleWorktree(
 	const errors: string[] = [];
 	let worktreeRemoved = false;
 	let branchRemoved = false;
+	let keptBranchTip: string | undefined;
 	if (intent.kind === "preserve" && intent.cleanupBlocker) {
 		return {
 			index: worktree.index,
@@ -1162,6 +1207,7 @@ function cleanupSingleWorktree(
 			branch: worktree.branch,
 			...(worktree.provider ? { provider: worktree.provider } : {}),
 			...(worktree.naming ? { naming: worktree.naming } : {}),
+			...(worktree.recordedBaseDir ? { recordedBaseDir: worktree.recordedBaseDir } : {}),
 			worktreeRemoved: false,
 			branchRemoved: false,
 			preserved: true,
@@ -1186,6 +1232,7 @@ function cleanupSingleWorktree(
 				branch: worktree.branch,
 				...(worktree.provider ? { provider: worktree.provider } : {}),
 				...(worktree.naming ? { naming: worktree.naming } : {}),
+				...(worktree.recordedBaseDir ? { recordedBaseDir: worktree.recordedBaseDir } : {}),
 				worktreeRemoved: false,
 				branchRemoved: false,
 				preserved: true,
@@ -1221,6 +1268,7 @@ function cleanupSingleWorktree(
 					branch: worktree.branch,
 					...(worktree.provider ? { provider: worktree.provider } : {}),
 					...(worktree.naming ? { naming: worktree.naming } : {}),
+					...(worktree.recordedBaseDir ? { recordedBaseDir: worktree.recordedBaseDir } : {}),
 					worktreeRemoved: false,
 					branchRemoved: false,
 					preserved: true,
@@ -1242,6 +1290,7 @@ function cleanupSingleWorktree(
 					branch: worktree.branch,
 					...(worktree.provider ? { provider: worktree.provider } : {}),
 					...(worktree.naming ? { naming: worktree.naming } : {}),
+					...(worktree.recordedBaseDir ? { recordedBaseDir: worktree.recordedBaseDir } : {}),
 					worktreeRemoved: false,
 					branchRemoved: false,
 					preserved: true,
@@ -1258,11 +1307,30 @@ function cleanupSingleWorktree(
 		errors.push(`worktree removal failed: ${error instanceof Error ? error.message : String(error)}`);
 	}
 	if (worktreeRemoved) {
-		try {
-			runGitChecked(setup.cwd, ["branch", "-D", worktree.branch]);
-			branchRemoved = true;
-		} catch (error) {
-			errors.push(`branch removal failed: ${error instanceof Error ? error.message : String(error)}`);
+		let deleteBranch = true;
+		if (intent.kind === "preserve") {
+			// The handoff patch keeps the child's content but not its commits, so a branch holding the only copy of them stays.
+			try {
+				const tip = runGitChecked(setup.cwd, ["rev-parse", "--verify", `refs/heads/${worktree.branch}^{commit}`]).trim();
+				if (tip !== setup.baseCommit) {
+					const containing = runGitChecked(setup.cwd, ["for-each-ref", "--contains", tip, "--format=%(refname)", "refs/heads", "refs/remotes", "refs/tags"]);
+					if (!containing.split("\n").some((ref) => ref && ref !== `refs/heads/${worktree.branch}`)) {
+						keptBranchTip = tip;
+						deleteBranch = false;
+					}
+				}
+			} catch (error) {
+				deleteBranch = false;
+				errors.push(`branch check failed: ${error instanceof Error ? error.message : String(error)}`);
+			}
+		}
+		if (deleteBranch) {
+			try {
+				runGitChecked(setup.cwd, ["branch", "-D", worktree.branch]);
+				branchRemoved = true;
+			} catch (error) {
+				errors.push(`branch removal failed: ${error instanceof Error ? error.message : String(error)}`);
+			}
 		}
 	}
 	return {
@@ -1271,8 +1339,10 @@ function cleanupSingleWorktree(
 		branch: worktree.branch,
 		...(worktree.provider ? { provider: worktree.provider } : {}),
 		...(worktree.naming ? { naming: worktree.naming } : {}),
+		...(worktree.recordedBaseDir ? { recordedBaseDir: worktree.recordedBaseDir } : {}),
 		worktreeRemoved,
 		branchRemoved,
+		...(keptBranchTip ? { keptBranchTip } : {}),
 		...(errors.length ? { errors } : {}),
 	};
 }
@@ -1310,7 +1380,7 @@ async function compensateSetup(tx: SetupTransaction): Promise<WorktreeCleanupRep
 		}
 		const known = setup.worktrees.find((worktree) => worktree.index === attempt.index);
 		const task: WorktreeCleanupTask = { index: attempt.index, path: attempt.path, branch: attempt.branch,
-			provider: known?.provider ?? "native", naming: known?.naming, worktreeRemoved: false, branchRemoved: false };
+			provider: known?.provider ?? "native", naming: known?.naming, recordedBaseDir: known?.recordedBaseDir, worktreeRemoved: false, branchRemoved: false };
 		report.tasks.push(task);
 		try {
 			if (normalizeComparableCwd(attempt.path) === normalizeComparableCwd(setup.cwd)) throw new Error("Refusing source-checkout removal");
@@ -1468,6 +1538,11 @@ export function diffWorktrees(setup: WorktreeSetup, agents: string[], diffsDir: 
 	return diffs;
 }
 
+/** A branch kept for its commits is a finished cleanup, the same as a removed one. */
+export function isWorktreeCleanupTaskDone(task: Pick<WorktreeCleanupTask, "worktreeRemoved" | "branchRemoved" | "keptBranchTip">): boolean {
+	return task.worktreeRemoved && (task.branchRemoved || task.keptBranchTip !== undefined);
+}
+
 export function cleanupWorktrees(
 	setup: WorktreeSetup,
 	intent: WorktreeCleanupIntent = { kind: "preserve", ...(setup.capturedDiffs ? { capturedDiffs: setup.capturedDiffs } : {}) },
@@ -1486,7 +1561,7 @@ export function cleanupWorktrees(
 	} catch (error) {
 		errors.push(`worktree prune failed: ${error instanceof Error ? error.message : String(error)}`);
 	}
-	const state = tasks.every((task) => task.worktreeRemoved && task.branchRemoved) && pruned ? "complete" : "partial";
+	const state = tasks.every(isWorktreeCleanupTaskDone) && pruned ? "complete" : "partial";
 	return {
 		state,
 		tasks,

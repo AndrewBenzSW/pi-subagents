@@ -62,7 +62,7 @@ describe("async chain root attachment", () => {
 			usage: result.usage,
 		}, {
 			agent: "worker",
-			importedPublication: { sessionId: "publication-session", toolCallId: "publication-tool-call" },
+			importedPublication: { sessionId: "publication-session", toolCallId: "publication-tool-call", snapshot: fs.readFileSync(importedRoot.resultPath, "utf-8") },
 			output: "root output",
 			exitCode: 0,
 			sessionFile,
@@ -176,7 +176,7 @@ describe("async chain root attachment", () => {
 		assert.equal(result.exitCode, 1);
 		assert.equal(result.error, "root failed");
 		assert.equal(result.output, "root failed");
-		assert.deepEqual(result.importedPublication, {});
+		assert.deepEqual(result.importedPublication, { snapshot: fs.readFileSync(importedRoot.resultPath, "utf-8") });
 	});
 
 	it("imports a partial root without collapsing it to failed", async () => {
@@ -194,7 +194,7 @@ describe("async chain root attachment", () => {
 			state: "partial",
 			success: false,
 			summary: "Required file-only output was not produced: report.md",
-			results: [{ agent: "worker", output: "Required file-only output was not produced: report.md", error: "Required file-only output was not produced: report.md", success: false, effects: { fileMutation: { status: "observed", expected: true, attempted: true, evidence: { source: "tracked-files", trackedOnly: true, cwd: tempDir, changedFiles: ["input.md"], attemptedMutation: true } } } }],
+			results: [{ agent: "worker", output: "Required file-only output was not produced: report.md", error: "Required file-only output was not produced: report.md", success: false, effects: { fileMutation: { status: "observed", attempted: true, evidence: { source: "tracked-files", trackedOnly: true, cwd: tempDir, changedFiles: ["input.md"], attemptedMutation: true } } } }],
 		});
 
 		const result = await waitForImportedAsyncRoot(importedRoot, { pollIntervalMs: 1 });
@@ -207,7 +207,7 @@ describe("async chain root attachment", () => {
 
 	it("fails a partial root that never produced a result file", async () => {
 		const importedRoot = root();
-		const effects = { fileMutation: { status: "observed", expected: true, attempted: true, evidence: { source: "tracked-files", trackedOnly: true, cwd: tempDir, changedFiles: ["input.md"], attemptedMutation: true } } };
+		const effects = { fileMutation: { status: "observed", attempted: true, evidence: { source: "tracked-files", trackedOnly: true, cwd: tempDir, changedFiles: ["input.md"], attemptedMutation: true } } };
 		writeJson(path.join(importedRoot.asyncDir, "status.json"), {
 			runId: importedRoot.runId,
 			mode: "single",

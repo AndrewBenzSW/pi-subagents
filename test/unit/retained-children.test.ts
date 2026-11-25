@@ -6,6 +6,8 @@ import { describe, it } from "node:test";
 import { formatRetainedChildren, listRetainedChildren } from "../../src/runs/background/retained-children.ts";
 import { updateActiveRunIndex } from "../../src/runs/background/active-run-index.ts";
 import { createRunFanoutBudget } from "../../src/runs/shared/run-fanout-budget.ts";
+import { recoveryDescriptorPath } from "../../src/runs/shared/run-launch-folder.ts";
+import { writeFileCreatingDir } from "../support/helpers.ts";
 
 interface WriteRunOptions {
 	sessionId?: string;
@@ -54,7 +56,7 @@ function writeRetainedRun(root: string, index: number, options: WriteRunOptions 
 	}), "utf-8");
 	updateActiveRunIndex(asyncDir, state);
 	if (options.recoveryDescriptor === "invalid") {
-		fs.writeFileSync(path.join(asyncDir, "recovery-descriptor.json"), JSON.stringify({
+		writeFileCreatingDir(recoveryDescriptorPath(path.dirname(asyncDir), path.basename(asyncDir)), JSON.stringify({
 			version: 2,
 			sourceRunId: runId,
 			agent: "worker",
@@ -63,7 +65,7 @@ function writeRetainedRun(root: string, index: number, options: WriteRunOptions 
 			outputMode: "inline",
 		}), "utf-8");
 	} else if (options.recoveryDescriptor !== "missing") {
-		fs.writeFileSync(path.join(asyncDir, "recovery-descriptor.json"), JSON.stringify({
+		writeFileCreatingDir(recoveryDescriptorPath(path.dirname(asyncDir), path.basename(asyncDir)), JSON.stringify({
 			version: 1,
 			runFanoutBudget: createRunFanoutBudget(runId, 64),
 			sourceRunId: options.recoverySourceRunId ?? runId,
@@ -107,6 +109,24 @@ describe("retained child roster", () => {
 			assert.equal(children[0]?.resumability.state, "resumable");
 			assert.match(formatted, /resumability: resumable\n  session: .*child-52\.jsonl\n  resume: subagent\(\{ action: "resume", id: "child-52", message: "\.\.\." \}\)/);
 			assert.equal(children.some((child) => child.runId === "child-50" || child.runId === "child-51"), false);
+			assert.doesNotMatch(formatted, /Launch a same-role fallback/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("explains exact-id inspection when the workflow-only roster is empty", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-retained-children-"));
+		try {
+			writeRetainedRun(root, 1, { parentWorkflowRunId: null });
+
+			const children = listRetainedChildren(path.join(root, "runs"), "parent-a");
+			const formatted = formatRetainedChildren(children);
+
+			assert.deepEqual(children, []);
+			assert.match(formatted, /children\.list is workflow-only and is not an exhaustive list of direct native children/);
+			assert.match(formatted, /action: "status".*status identifies the candidate.*action: "resume".*authoritatively checks eligibility and may reject it/);
+			assert.match(formatted, /fallback.*only when there is no known candidate or resume rejects eligibility/);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
@@ -151,7 +171,7 @@ describe("retained child roster", () => {
 				["child-9", { state: "not-resumable", reason: "external runner" }],
 				["child-8", { state: "not-resumable", reason: "recovery descriptor belongs to agent reviewer" }],
 				["child-7", { state: "not-resumable", reason: "recovery descriptor belongs to run other-run" }],
-				["child-6", { state: "not-resumable", reason: `invalid recovery descriptor: Invalid async recovery descriptor '${path.join(root, "runs", "child-6", "recovery-descriptor.json")}': version must be 1.` }],
+				["child-6", { state: "not-resumable", reason: `invalid recovery descriptor: Invalid async recovery descriptor '${recoveryDescriptorPath(path.join(root, "runs"), "child-6")}': version must be 1.` }],
 				["child-5", { state: "not-resumable", reason: "missing recovery descriptor" }],
 				["child-4", { state: "not-resumable", reason: "external runner" }],
 				["child-3", { state: "not-resumable", reason: "stopped run" }],
@@ -166,7 +186,9 @@ describe("retained child roster", () => {
 			assert.match(formatted, /resumability: not resumable \(stopped run\)/);
 			assert.match(formatted, /resumability: not resumable \(no persisted session file\)/);
 			assert.doesNotMatch(formatted, /resume: subagent/);
-			assert.match(formatted, /No resumable retained child is listed\. Launch a same-role fallback challenge and label it as fallback\./);
+			assert.match(formatted, /No resumable retained workflow child is listed/);
+			assert.match(formatted, /action: "status".*status identifies the candidate.*action: "resume".*authoritatively checks eligibility and may reject it/);
+			assert.match(formatted, /fallback.*only when there is no known candidate or resume rejects eligibility/);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}

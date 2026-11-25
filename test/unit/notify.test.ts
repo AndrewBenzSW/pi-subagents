@@ -6,19 +6,127 @@ import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import registerSubagentNotify, {
 	buildCompletionDetails,
+	createCompletionSendRegistry,
 	formatGroupedCompletion,
+	type CompletionNotifier,
 	formatSingleCompletion,
 	parseSubagentNotifyContent,
 	type RegisterSubagentNotifyOptions,
 	type SubagentNotifyDetails,
 	scheduledCompletionTriggersTurn,
+	incrementalChildCompletionTriggersTurn,
 } from "../../src/runs/background/notify.ts";
 import { SUBAGENT_ASYNC_COMPLETE_EVENT, SUBAGENT_FOREGROUND_COMPLETE_EVENT } from "../../src/shared/types.ts";
 import { createResultDeliveryOwnership } from "../../src/runs/background/result-delivery-ownership.ts";
+import { recordSessionReplacement } from "../../src/shared/session-succession.ts";
+import { createParentWake } from "../../src/shared/parent-wake.ts";
+import { finalizeSingleOutput } from "../../src/runs/shared/single-output.ts";
+import { formatPartialOutput, timedOutRunSummary } from "../../src/runs/shared/partial-output.ts";
+import { buildTimeoutRecoverySummary } from "../../src/runs/shared/mutation-evidence.ts";
+import { formatOutputArtifactContent } from "../../src/shared/artifacts.ts";
+import { claimWorkflowResume } from "../../src/workflows/workflow-resume-claim.ts";
 
 const COMPLETION_OWNER_ID = "completion-owner-a";
+const completionContent = (content: string) => `${content}\n\nParent action: Read the saved results above and resume the already-authorized parent task, or report completion. If approval is required, explicitly ask the user. Do not silently yield, rerun completed work, or infer new authorization.`;
+
+it("keeps reload wakes scoped to one session manager and clears them on quit", async () => {
+	const owner = SessionManager.inMemory();
+	const sessionId = owner.getSessionId();
+	const otherOwner = { getSessionId: () => sessionId };
+	const create = (sessionManager: Parameters<CompletionNotifier["bindSession"]>[0]) => {
+		const messages: any[] = [];
+		const pi = {
+			events: createEventBus(),
+			isHeld: () => false,
+			sendMessage(message: unknown) { messages.push(message); },
+		} as unknown as Parameters<typeof registerSubagentNotify>[0];
+		const notifier = registerSubagentNotify(pi, { currentSessionId: sessionId, completionOwnerId: COMPLETION_OWNER_ID }, { batchConfig: { enabled: false } });
+		notifier.bindSession(sessionManager);
+		return { notifier, messages };
+	};
+	const first = create(owner);
+	await first.notifier.deliver({ id: "queued-wake-scope-result", sessionId, completionOwnerId: COMPLETION_OWNER_ID, success: false, summary: "Needs attention" });
+	assert.equal(first.notifier.hasPendingDelivery(), true);
+	first.notifier.sessionShutdown("reload");
+	first.notifier.dispose();
+	const other = create(otherOwner);
+	const replacement = create(owner);
+	assert.equal(other.notifier.hasPendingDelivery(), false, "even the same session ID on a different manager must not inherit another queue");
+	assert.equal(replacement.notifier.hasPendingDelivery(), true);
+	other.notifier.messageStarted({ role: "custom", ...first.messages[0] });
+	assert.equal(replacement.notifier.hasPendingDelivery(), true, "foreign consumption cannot clear the owner's wake");
+	replacement.notifier.messageStarted({ role: "custom", ...first.messages[0] });
+	assert.equal(replacement.notifier.hasPendingDelivery(), false);
+	await replacement.notifier.deliver({ id: "queued-wake-quit-result", sessionId, completionOwnerId: COMPLETION_OWNER_ID, success: false, summary: "Another wake" });
+	replacement.notifier.sessionShutdown("quit");
+	replacement.notifier.dispose();
+	const reopened = create(owner);
+	assert.equal(reopened.notifier.hasPendingDelivery(), false, "quit clears wakes even if a manager is reused");
+	await reopened.notifier.deliver({ id: "queued-wake-switch-result", sessionId, completionOwnerId: COMPLETION_OWNER_ID, success: false, summary: "Old session wake" });
+	assert.equal(reopened.notifier.hasPendingDelivery(), true);
+	owner.newSession();
+	assert.notEqual(owner.getSessionId(), sessionId);
+	reopened.notifier.bindSession(owner);
+	assert.equal(reopened.notifier.hasPendingDelivery(), false, "changing session UUID on the same manager must discard old wakes");
+	reopened.notifier.dispose();
+	other.notifier.dispose();
+});
+
+it("keeps wakes accepted before the first session bind", async () => {
+	const owner = SessionManager.inMemory();
+	const sessionId = owner.getSessionId();
+	const messages: any[] = [];
+	const pi = {
+		events: createEventBus(),
+		isHeld: () => false,
+		sendMessage(message: unknown) { messages.push(message); },
+	} as unknown as Parameters<typeof registerSubagentNotify>[0];
+	const first = registerSubagentNotify(pi, { currentSessionId: sessionId, completionOwnerId: COMPLETION_OWNER_ID }, { batchConfig: { enabled: false } });
+	first.bindSession(owner);
+	first.sessionShutdown("reload");
+	first.dispose();
+	const replacement = registerSubagentNotify(pi, { currentSessionId: sessionId, completionOwnerId: COMPLETION_OWNER_ID }, { batchConfig: { enabled: false } });
+	await replacement.deliver({ id: "queued-wake-before-bind", sessionId, completionOwnerId: COMPLETION_OWNER_ID, success: false, summary: "Early wake" });
+	replacement.bindSession(owner);
+	assert.equal(replacement.hasPendingDelivery(), true, "binding must not drop a wake accepted before session_start");
+	replacement.messageStarted({ role: "custom", ...messages[0] });
+	assert.equal(replacement.hasPendingDelivery(), false);
+	replacement.dispose();
+});
+
+it("holds a completion that wakes an idle parent until Pi starts its message", async () => {
+	const owner = SessionManager.inMemory();
+	const sessionId = owner.getSessionId();
+	const calls: unknown[][] = [];
+	const parentWake = createParentWake({ sendMessage: (...args: unknown[]) => { calls.push(args); } } as never);
+	parentWake.bindSession({ isIdle: () => true, sessionManager: owner } as never);
+	const notifier = registerSubagentNotify({ events: createEventBus(), sendMessage: parentWake.sendMessage, isHeld: parentWake.isHeld }, { currentSessionId: sessionId, completionOwnerId: COMPLETION_OWNER_ID }, { batchConfig: { enabled: false } });
+	notifier.bindSession(owner);
+	await notifier.deliver({ id: "idle-wake-result", sessionId, completionOwnerId: COMPLETION_OWNER_ID, success: false, summary: "Needs attention" });
+	assert.deepEqual(calls.map((call) => call[1]), [{ triggerTurn: true }], "one turn-triggering notice, no user message");
+	assert.equal(notifier.hasPendingDelivery(), true, "the notice that starts the run is pending until its message_start");
+	notifier.messageStarted({ role: "custom", ...(calls[0]![0] as object) } as never);
+	assert.equal(notifier.hasPendingDelivery(), false);
+	notifier.dispose();
+});
+
+it("does not deliver awaited workflow child lifecycle completions", async () => {
+	const { events, sent, dispose } = createPi();
+	try {
+		events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, {
+			id: "awaited-child", runId: "awaited-child", sessionId: "session-1", completionOwnerId: COMPLETION_OWNER_ID,
+			agent: "echo", mode: "single", state: "complete", success: true, summary: "private result",
+			awaitedByWorkflow: true, parentWorkflowRunId: "workflow", triggerTurn: false,
+		});
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		assert.deepEqual(sent, []);
+	} finally {
+		dispose();
+	}
+});
 
 it("keeps model-authored receipt lines in the preview, never in receipt metadata", () => {
 	for (const resultPreview of [
@@ -53,6 +161,50 @@ it("surfaces published workflow receipts outside single and grouped previews", (
 	assert.doesNotMatch(parsed?.resultPreview ?? "", /Workflow receipt:/);
 });
 
+it("prints what happens next to an interrupted workflow right after its run id, and keeps it out of a re-rendered preview", () => {
+	const root = mkdtempSync(join(tmpdir(), "notify-resume-line-"));
+	try {
+		const interrupted = (asyncDir: string) => ({ agent: "workflow", mode: "workflow", runId: "wf-auto", success: false, state: "stopped", summary: "Workflow stopped.", asyncDir, workflow: { stopCause: "runtime-replaced" } });
+		// The line is read from the run only for a workflow that a runtime replacement or a Pi exit stopped.
+		const claimed = join(root, "wf-auto");
+		mkdirSync(claimed);
+		claimWorkflowResume(claimed, { newRunId: "wf-auto-next", trigger: "auto" });
+		const details = buildCompletionDetails(interrupted(claimed));
+		assert.equal(details.resumeNotice, "Auto-resumed as wf-auto-next.");
+		const { workflow: _workflow, ...withoutStopCause } = interrupted(claimed);
+		assert.equal(buildCompletionDetails(withoutStopCause).resumeNotice, undefined);
+		assert.equal(buildCompletionDetails({ ...interrupted(claimed), workflow: { stopCause: "user" } }).resumeNotice, undefined);
+		assert.equal(buildCompletionDetails({ ...interrupted(claimed), agent: "worker", mode: "single" }).resumeNotice, undefined);
+
+		const forms = [
+			"Auto-resumed as wf-auto-next.",
+			"Resumed as wf-auto-next.",
+			"Relaunched as wf-auto-next.",
+			'Not auto-resumed: the session already runs 2 async workflows. Resume by hand: subagent({ action: "resume", id: "wf-auto" })',
+			'Resume by hand: subagent({ action: "resume", id: "wf-auto" })',
+			'Relaunch it by hand with options: { reuseFrom: "wf-auto" }.',
+		];
+		for (const line of forms) {
+			const withLine = { ...details, resumeNotice: line };
+			for (const text of [formatSingleCompletion(withLine), formatGroupedCompletion([withLine, buildCompletionDetails({ agent: "worker", success: true, summary: "done" })])]) {
+				const lines = text.split("\n");
+				assert.equal(lines[lines.indexOf("Workflow run: wf-auto") + 1], line, text);
+				assert.equal(lines.filter((entry) => entry === line).length, 1, text);
+			}
+			const parsed = parseSubagentNotifyContent(formatSingleCompletion(withLine));
+			assert.equal(parsed?.resumeNotice, line);
+			assert.ok(!parsed?.resultPreview.includes(line), parsed?.resultPreview);
+			assert.equal(formatSingleCompletion(parsed!).split("\n").filter((entry) => entry === line).length, 1);
+		}
+		// A line the model wrote is output, not the resume line.
+		const modelText = parseSubagentNotifyContent("Background task completed: **worker**\n\nResumed as nothing.\n\nWorkflow run: wf-x\nChild runs: a=1");
+		assert.equal(modelText?.resumeNotice, undefined);
+		assert.match(modelText?.resultPreview ?? "", /Resumed as nothing\./);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
 function createEventBus() {
 	const emitter = new EventEmitter();
 	return {
@@ -73,7 +225,7 @@ function createPi(currentSessionId = "session-1", registerOptions: RegisterSubag
 	const events = createEventBus();
 	const sent: Array<{ message: unknown; options: unknown }> = [];
 	const pi = {
-		events,
+		events, isHeld: () => false,
 		sendMessage(message: unknown, options: unknown) {
 			sent.push({ message, options });
 		},
@@ -81,7 +233,11 @@ function createPi(currentSessionId = "session-1", registerOptions: RegisterSubag
 
 	// Formatting-focused tests run with batching disabled so single completions
 	// emit synchronously. Batching behavior is covered by the dedicated suite below.
-	const notifier = registerSubagentNotify(pi as never, { currentSessionId, completionOwnerId: COMPLETION_OWNER_ID }, { batchConfig: { enabled: false }, ...registerOptions });
+	const notifier = registerSubagentNotify(pi as never, { currentSessionId, completionOwnerId: COMPLETION_OWNER_ID }, {
+		batchConfig: { enabled: false },
+		sendRegistry: createCompletionSendRegistry(),
+		...registerOptions,
+	});
 
 	return { events, sent, notifier, dispose: () => notifier.dispose() };
 }
@@ -90,7 +246,7 @@ function createBatchingPi(clock: ReturnType<typeof createFakeClock>, currentSess
 	const events = createEventBus();
 	const sent: Array<{ message: unknown; options: unknown }> = [];
 	const pi = {
-		events,
+		events, isHeld: () => false,
 		sendMessage(message: unknown, options: unknown) {
 			sent.push({ message, options });
 		},
@@ -99,6 +255,7 @@ function createBatchingPi(clock: ReturnType<typeof createFakeClock>, currentSess
 		batchConfig: { enabled: true, debounceMs: 150, maxWaitMs: 1000, stragglerDebounceMs: 75, stragglerMaxWaitMs: 400, stragglerWindowMs: 2000 },
 		timers: clock.api,
 		now: clock.now,
+		sendRegistry: createCompletionSendRegistry(),
 	});
 	return { events, sent, notifier, dispose: () => notifier.dispose() };
 }
@@ -153,6 +310,124 @@ function completionResult(overrides: Record<string, unknown> = {}) {
 }
 
 describe("registerSubagentNotify", () => {
+	it("sends one async notification and turn across duplicate registrations", () => {
+		const events = createEventBus();
+		const sent: Array<{ options: unknown }> = [];
+		const registry = createCompletionSendRegistry();
+		const pi = { events, isHeld: () => false, sendMessage(_message: unknown, options: unknown) { sent.push({ options }); } };
+		const state = { currentSessionId: "session-a", completionOwnerId: COMPLETION_OWNER_ID };
+		const options = { batchConfig: { enabled: false }, sendRegistry: registry } as const;
+		const first = registerSubagentNotify(pi as never, state, options);
+		const second = registerSubagentNotify(pi as never, state, options);
+		try {
+			events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, completionResult({ id: "shared-async" }));
+			assert.equal(sent.length, 1);
+			assert.deepEqual(sent[0]?.options, { triggerTurn: true });
+		} finally {
+			first.dispose();
+			second.dispose();
+		}
+	});
+
+	it("sends one foreground notification across duplicate registrations", () => {
+		const events = createEventBus();
+		const sent: unknown[] = [];
+		const registry = createCompletionSendRegistry();
+		const pi = { events, isHeld: () => false, sendMessage(message: unknown) { sent.push(message); } };
+		const state = { currentSessionId: "session-a", completionOwnerId: COMPLETION_OWNER_ID };
+		const options = { batchConfig: { enabled: false }, sendRegistry: registry } as const;
+		const first = registerSubagentNotify(pi as never, state, options);
+		const second = registerSubagentNotify(pi as never, state, options);
+		try {
+			events.emit(SUBAGENT_FOREGROUND_COMPLETE_EVENT, completionResult({ id: "shared-foreground", source: "foreground" }));
+			assert.equal(sent.length, 1);
+		} finally {
+			first.dispose();
+			second.dispose();
+		}
+	});
+
+	it("releases a failed send claim for another registration", () => {
+		const events = createEventBus();
+		const registry = createCompletionSendRegistry();
+		let attempts = 0;
+		let accepted = 0;
+		const pi = { events, isHeld: () => false, sendMessage() {
+			attempts += 1;
+			if (attempts === 1) throw new Error("runtime inactive");
+			accepted += 1;
+		} };
+		const state = { currentSessionId: "session-a", completionOwnerId: COMPLETION_OWNER_ID };
+		const options = { batchConfig: { enabled: false }, sendRegistry: registry } as const;
+		const first = registerSubagentNotify(pi as never, state, options);
+		const second = registerSubagentNotify(pi as never, state, options);
+		try {
+			events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, completionResult({ id: "retry-after-failure" }));
+			assert.equal(attempts, 2);
+			assert.equal(accepted, 1);
+		} finally {
+			first.dispose();
+			second.dispose();
+		}
+	});
+
+	it("joins a re-entrant duplicate to the actual send outcome", async () => {
+		const registry = createCompletionSendRegistry();
+		const result = completionResult({ id: "reentrant-send" });
+		let reentrant: Promise<boolean> | undefined;
+		let sends = 0;
+		let second!: ReturnType<typeof registerSubagentNotify>;
+		const pi = { events: createEventBus(), isHeld: () => false, sendMessage() {
+			sends += 1;
+			reentrant = second.deliver(result);
+		} };
+		const state = { currentSessionId: "session-a", completionOwnerId: COMPLETION_OWNER_ID };
+		const options = { batchConfig: { enabled: false }, sendRegistry: registry } as const;
+		const first = registerSubagentNotify(pi as never, state, options);
+		second = registerSubagentNotify(pi as never, state, options);
+		try {
+			assert.equal(await first.deliver(result), true);
+			assert.equal(await reentrant, true);
+			assert.equal(sends, 1);
+		} finally {
+			first.dispose();
+			second.dispose();
+		}
+	});
+
+	it("keeps identical completion ids isolated by session", async () => {
+		const registry = createCompletionSendRegistry();
+		const sent: unknown[] = [];
+		const pi = { events: createEventBus(), isHeld: () => false, sendMessage(message: unknown) { sent.push(message); } };
+		const options = { batchConfig: { enabled: false }, sendRegistry: registry } as const;
+		const first = registerSubagentNotify(pi as never, { currentSessionId: "session-a", completionOwnerId: COMPLETION_OWNER_ID }, options);
+		const second = registerSubagentNotify(pi as never, { currentSessionId: "session-b", completionOwnerId: COMPLETION_OWNER_ID }, options);
+		try {
+			assert.equal(await first.deliver(completionResult({ id: "same-id", sessionId: "session-a" })), true);
+			assert.equal(await second.deliver(completionResult({ id: "same-id", sessionId: "session-b" })), true);
+			assert.equal(sent.length, 2);
+		} finally {
+			first.dispose();
+			second.dispose();
+		}
+	});
+
+	it("expires and caps completed process send claims without timers", async () => {
+		const expiring = createCompletionSendRegistry(10, 2);
+		const first = expiring.claim("first", 0);
+		first.settle?.(true);
+		assert.equal((await expiring.claim("first", 10).outcome), true);
+		assert.equal(expiring.claim("first", 11).owned, true);
+
+		const capped = createCompletionSendRegistry(10_000, 2);
+		for (const key of ["a", "b", "c"]) {
+			const claim = capped.claim(key, 0);
+			claim.settle?.(true);
+		}
+		assert.equal(capped.claim("a", 0).owned, true);
+		assert.equal(capped.claim("c", 0).owned, false);
+	});
+
 	it("keeps a successful background completion hidden while waking the originating session", () => {
 		const { events, sent } = createPi();
 
@@ -171,11 +446,44 @@ describe("registerSubagentNotify", () => {
 		assert.deepEqual(sent[0], {
 			message: {
 				customType: "subagent-notify",
-				content: "Background task completed: **worker**\n\n(no output)",
+				content: completionContent("Background task completed: **worker**\n\n(no output)"),
 				display: false,
+				details: { runs: [{ agent: "worker", status: "completed", runId: "notify-empty-1" }] },
 			},
 			options: { triggerTurn: true },
 		});
+	});
+
+	it("attaches run ids and paths to subagent-notify details without the text previews", async () => {
+		const { notifier, sent } = createPi("session-a");
+		assert.equal(await notifier.deliver(completionResult({ id: "single-run", asyncDir: "/tmp/async/single-run", durationMs: 1200, summary: "Single done" })), true);
+		assert.equal(await notifier.deliver(completionResult({
+			id: "wf-run",
+			runId: "wf-run",
+			mode: "workflow",
+			agent: "workflow",
+			summary: "Workflow done",
+			results: [
+				{ workflowKey: "scan", agent: "scout", runId: "child-a", status: "completed", success: true, output: "scan output", outputReference: "/tmp/out/scan.md" },
+				{ workflowKey: "fix", agent: "worker", runId: "child-b", status: "completed", success: true, output: "fix output" },
+			],
+		})), true);
+		const details = sent.map((call) => (call.message as { details?: unknown }).details);
+		assert.deepEqual(details[0], { runs: [{ agent: "worker", status: "completed", runId: "single-run", asyncDir: "/tmp/async/single-run", durationMs: 1200 }] });
+		assert.deepEqual(details[1], { runs: [{
+			agent: "workflow",
+			status: "completed",
+			runId: "wf-run",
+			workflowRunId: "wf-run",
+			childRuns: [
+				{ runId: "child-a", workflowKey: "scan", agent: "scout", status: "completed" },
+				{ runId: "child-b", workflowKey: "fix", agent: "worker", status: "completed" },
+			],
+			childOutputs: [
+				{ workflowKey: "scan", runId: "child-a", agent: "scout", status: "completed", savedOutputPath: "/tmp/out/scan.md" },
+				{ workflowKey: "fix", runId: "child-b", agent: "worker", status: "completed" },
+			],
+		}] });
 	});
 
 	it("does not attach async status snapshots to subagent-notify details", async () => {
@@ -199,13 +507,13 @@ describe("registerSubagentNotify", () => {
 		assert.equal(sent.length, 0);
 	});
 
-	it("accepts only explicitly claimed predecessor-session completions", async () => {
+	it("accepts completions of a session this process replaced", async () => {
 		const events = createEventBus();
 		const sent: unknown[] = [];
-		const pi = { events, sendMessage(message: unknown) { sent.push(message); } };
+		const pi = { events, isHeld: () => false, sendMessage(message: unknown) { sent.push(message); } };
 		const state = { currentSessionId: "session-old" as string | null, completionOwnerId: COMPLETION_OWNER_ID };
 		const ownership = createResultDeliveryOwnership(state);
-		assert.equal(ownership.claimPredecessor("session-old", "session-old"), true);
+		recordSessionReplacement("session-new", "session-old");
 		state.currentSessionId = "session-new";
 		const notifier = registerSubagentNotify(pi as never, state, { batchConfig: { enabled: false }, ownership });
 		try {
@@ -222,7 +530,7 @@ describe("registerSubagentNotify", () => {
 		const clock = createFakeClock();
 		const events = createEventBus();
 		const sent: unknown[] = [];
-		const pi = { events, sendMessage(message: unknown) { sent.push(message); } };
+		const pi = { events, isHeld: () => false, sendMessage(message: unknown) { sent.push(message); } };
 		const state = { currentSessionId: "session-a" as string | null, completionOwnerId: COMPLETION_OWNER_ID };
 		const notifier = registerSubagentNotify(pi as never, state, {
 			batchConfig: { enabled: true, debounceMs: 150, maxWaitMs: 1000, stragglerDebounceMs: 75, stragglerMaxWaitMs: 400, stragglerWindowMs: 2000 },
@@ -285,8 +593,9 @@ describe("registerSubagentNotify", () => {
 		assert.deepEqual(sent[0], {
 			message: {
 				customType: "subagent-notify",
-				content: "Detached foreground task completed: **reviewer**\n\nRecovered final review",
+				content: completionContent("Detached foreground task completed: **reviewer**\n\nRecovered final review"),
 				display: true,
+				details: { runs: [{ agent: "reviewer", status: "completed", source: "foreground", runId: "foreground-run" }] },
 			},
 			options: { triggerTurn: true },
 		});
@@ -327,8 +636,9 @@ describe("registerSubagentNotify", () => {
 		assert.deepEqual(sent[0], {
 			message: {
 				customType: "subagent-notify",
-				content: `Background task completed: **worker** (2/3)\n\n${summary}`,
+				content: completionContent(`Background task completed: **worker** (2/3)\n\n${summary}`),
 				display: false,
+				details: { runs: [{ agent: "worker", status: "completed", taskInfo: " (2/3)", runId: "notify-summary-1" }] },
 			},
 			options: { triggerTurn: true },
 		});
@@ -352,8 +662,9 @@ describe("registerSubagentNotify", () => {
 		assert.deepEqual(sent, [{
 			message: {
 				customType: "subagent-notify",
-				content: "Background task completed: **worker**\n\nDone\n\nSession file: /tmp/session.jsonl",
+				content: completionContent("Background task completed: **worker**\n\nDone\n\nSession file: /tmp/session.jsonl"),
 				display: false,
+				details: { runs: [{ agent: "worker", status: "completed", runId: "notify-path-1", sessionLabel: "Session file", sessionValue: "/tmp/session.jsonl" }] },
 			},
 			options: { triggerTurn: true },
 		}]);
@@ -377,8 +688,9 @@ describe("registerSubagentNotify", () => {
 		assert.deepEqual(sent[0], {
 			message: {
 				customType: "subagent-notify",
-				content: "Background task paused: **worker**\n\nPaused after interrupt. Waiting for explicit next action.",
+				content: completionContent("Background task paused: **worker**\n\nPaused after interrupt. Waiting for explicit next action."),
 				display: true,
+				details: { runs: [{ agent: "worker", status: "paused", runId: "notify-paused-1" }] },
 			},
 			options: { triggerTurn: true },
 		});
@@ -405,8 +717,16 @@ describe("registerSubagentNotify", () => {
 		assert.deepEqual(sent[0], {
 			message: {
 				customType: "subagent-notify",
-				content: "Background task paused: **workflow**\n\nRun 'detaches' detached for intercom coordination.\n\nChild outputs:\n- key=detaches run=child-1 status=paused\n  Saved output: unavailable\n  Preview: unavailable (no safe inline output)\n\nWorkflow run: workflow-1\nChild runs: detaches=child-1 (paused)",
+				content: completionContent("Background task paused: **workflow**\n\nRun 'detaches' detached for intercom coordination.\n\nChild outputs:\n- key=detaches run=child-1 status=paused\n  Saved output: unavailable\n  Preview: unavailable (no safe inline output)\n\nWorkflow run: workflow-1\nChild runs: detaches=child-1 (paused)"),
 				display: true,
+				details: { runs: [{
+					agent: "workflow",
+					status: "paused",
+					runId: "workflow-1",
+					workflowRunId: "workflow-1",
+					childRuns: [{ runId: "child-1", workflowKey: "detaches", agent: "worker", status: "paused" }],
+					childOutputs: [{ workflowKey: "detaches", runId: "child-1", agent: "worker", status: "paused" }],
+				}] },
 			},
 			options: { triggerTurn: true },
 		});
@@ -448,7 +768,6 @@ describe("registerSubagentNotify", () => {
 		assert.match((sent[0]!.message as { content: string }).content, /Background task completed: \*\*ok-1\*\*/);
 		assert.match((sent[1]!.message as { content: string }).content, /Background task failed: \*\*fail-1\*\*/);
 
-		// No deferred emission should arrive later.
 		clock.advance(1000);
 		assert.equal(sent.length, 2);
 	});
@@ -472,6 +791,7 @@ describe("registerSubagentNotify", () => {
 			customType: "subagent-notify",
 			content,
 			display: false,
+			details: { runs: [{ agent: "alpha", status: "completed", runId: "g-1" }, { agent: "beta", status: "completed", runId: "g-2" }, { agent: "gamma", status: "completed", runId: "g-3" }] },
 		});
 		assert.deepEqual(sent[0]!.options, { triggerTurn: true });
 	});
@@ -565,6 +885,22 @@ describe("completion formatting helpers", () => {
 			summary: "Done",
 			parallelHandoff: { path: "/tmp/run/handoff.json" },
 		}).handoffPath, "/tmp/run/handoff.json");
+	});
+
+	it("names a branch worktree cleanup kept under the parallel handoff line", () => {
+		const tip = "0123456789abcdef0123456789abcdef01234567";
+		const details = buildCompletionDetails({
+			id: "run",
+			agent: "worker",
+			success: true,
+			summary: "Done",
+			parallelHandoff: { path: "/tmp/run/handoff.json", keptBranches: [{ branch: "pi-subagents/run-0", tip }] },
+		});
+		const content = formatSingleCompletion(details);
+		assert.match(content, /\nParallel handoff: \/tmp\/run\/handoff\.json\nKept branch pi-subagents\/run-0 at 0123456789ab: its commits are on no other branch\./);
+		const parsed = parseSubagentNotifyContent(content);
+		assert.equal(parsed?.resultPreview, "Done");
+		assert.equal(formatSingleCompletion(parsed!), content);
 	});
 
 	it("formatSingleCompletion mirrors the in-handler single message shape", () => {
@@ -845,7 +1181,7 @@ describe("completion formatting helpers", () => {
 	});
 
 	it("reports false when Pi rejects sendMessage synchronously", async () => {
-		const pi = { events: createEventBus(), sendMessage() { throw new Error("runtime inactive"); } };
+		const pi = { events: createEventBus(), isHeld: () => false, sendMessage() { throw new Error("runtime inactive"); } };
 		const notifier = registerSubagentNotify(pi as never, { currentSessionId: "session-a" }, { batchConfig: { enabled: false } });
 		assert.equal(await notifier.deliver(completionResult({ id: "direct-rejected" })), false);
 		notifier.dispose();
@@ -856,6 +1192,8 @@ describe("completion formatting helpers", () => {
 		assert.equal(buildCompletionDetails({ id: "x", agent: "w", success: false, interrupted: true, summary: "interrupted", timestamp: 1 }).status, "paused");
 		const pausedWorkflow = buildCompletionDetails({ id: "workflow", agent: "workflow", mode: "workflow", state: "paused", results: [{ workflowKey: "failed", success: false }] });
 		assert.equal(pausedWorkflow.childOutputs?.[0]?.status, "failed");
+		const runningWorkflow = buildCompletionDetails({ id: "workflow", agent: "workflow", mode: "workflow", success: true, results: [{ workflowKey: "running", state: "running" }] });
+		assert.equal(runningWorkflow.taskInfo, " (dispatch complete; 1 child running or uncollected)");
 		assert.equal(buildCompletionDetails({ id: "x", agent: "w", success: false, summary: "boom", exitCode: 1, timestamp: 1 }).status, "failed");
 		assert.equal(buildCompletionDetails({ id: "x", agent: "w", success: false, summary: "terminated", exitCode: 1, processSignal: "SIGTERM", timestamp: 1 }).status, "stopped");
 		assert.equal(buildCompletionDetails({ id: "x", agent: "w", success: false, summary: "terminated", results: [{ success: false, exitCode: 1, processSignal: "SIGTERM" }], timestamp: 1 }).status, "stopped");
@@ -981,6 +1319,27 @@ describe("scheduled completions", () => {
 		assert.equal((sent[0]!.message as { display?: boolean }).display, true);
 	});
 
+	it("wakes once for an actionable child failure but not an ordinary running success", () => {
+		const triggerTurns: boolean[] = [];
+		const pi = {
+			sendMessage(_message: unknown, options: unknown) {
+				if ((options as { triggerTurn?: boolean }).triggerTurn === true) triggerTurns.push(true);
+			},
+		};
+		for (const notification of [
+			{ workflowRunId: "workflow-1", childKey: "ready", outcome: "completed" as const, workflowRunning: true },
+			{ workflowRunId: "workflow-1", childKey: "broken", outcome: "failed" as const, workflowRunning: true },
+		]) {
+			pi.sendMessage(notification, { triggerTurn: incrementalChildCompletionTriggersTurn(notification, undefined) });
+		}
+		assert.equal(triggerTurns.length, 1, "only the actionable child failure should trigger a provider turn");
+	});
+
+	it("keeps a terminal child settlement as the workflow barrier", () => {
+		const terminal = { workflowRunId: "workflow-2", childKey: "last", outcome: "completed" as const, workflowRunning: false };
+		assert.equal(incrementalChildCompletionTriggersTurn(terminal, undefined), true);
+	});
+
 	it("still wakes the session when a quiet scheduled run fails, stops, or pauses", async () => {
 		const quietOrigin = { ...scheduledResult.scheduleOrigin, quiet: true };
 		assert.equal(scheduledCompletionTriggersTurn({ id: "45daa203" }, "completed"), true);
@@ -1058,5 +1417,152 @@ describe("watchdog blockers in completion notices", () => {
 		assert.match(grouped, /Watchdog blockers:\n- worker: Claims tests passed without running them \(unaddressed\)/);
 		assert.equal(grouped.split("Watchdog blockers:").length, 2);
 
+	});
+});
+
+describe("completion notice output size", () => {
+	const longOutput = (marker: string) => Array.from({ length: 200 }, (_, index) => `${marker} line ${index} ${"x".repeat(40)}`).join("\n");
+
+	it("inlines the head of a long single-child output and names the file that holds all of it", () => {
+		const root = mkdtempSync(join(tmpdir(), "notify-output-head-"));
+		try {
+			const artifact = join(root, "worker_output.md");
+			const output = longOutput("single");
+			writeFileSync(artifact, output);
+			const notice = (text: string, outputPath: string) => formatSingleCompletion(buildCompletionDetails({
+				agent: "worker", success: true, summary: `worker:\n${text}`,
+				results: [{ agent: "worker", success: true, output: text, artifactPaths: { outputPath } }],
+			}));
+
+			const content = notice(output, artifact);
+			assert.ok(content.includes(output.slice(0, 1_500)));
+			assert.ok(!content.includes("single line 199"));
+			assert.match(content, /\nFull output: .*worker_output\.md \(\d+\.\d KB, 200 lines\)\. Read it if needed\./);
+			assert.ok(content.length < 2_500);
+			assert.match(parseSubagentNotifyContent(content)?.resultPreview ?? "", /Full output: /);
+
+			const short = notice("short output", artifact);
+			assert.match(short, /worker:\nshort output/);
+			assert.doesNotMatch(short, /Full output:/);
+			assert.ok(notice(output, join(root, "missing.md")).includes(output), "without a full-output file the output stays inline");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("shows a timed-out child's capped partial output, its file and its recovery summary instead of only the timeout line", () => {
+		const root = mkdtempSync(join(tmpdir(), "notify-output-timeout-"));
+		try {
+			const artifact = join(root, "worker_output.md");
+			const partial = formatPartialOutput(longOutput("partial"), "timeout");
+			const timeout = "Subagent timed out after 300000ms.";
+			// As the runner does: the artifact holds the partial text, and the published output adds the recovery summary.
+			writeFileSync(artifact, formatOutputArtifactContent({ output: partial, error: timeout }));
+			const recovery = buildTimeoutRecoverySummary({
+				termination: "timed-out",
+				evidence: { source: "tracked-files", trackedOnly: true, changedFiles: [], attemptedMutation: false },
+				artifactPaths: { inputPath: join(root, "worker_input.md"), outputPath: artifact, jsonlPath: join(root, "worker.jsonl"), transcriptPath: join(root, "worker_transcript.md"), metadataPath: join(root, "worker_meta.json") },
+			}).message;
+			const output = `${partial}\n\n${recovery}`;
+			const result = { agent: "worker", success: false, timedOut: true, outputPartial: true, output, error: timeout, artifactPaths: { outputPath: artifact } };
+			const content = formatSingleCompletion(buildCompletionDetails({
+				agent: "worker", success: false, timedOut: true, error: timeout,
+				summary: timedOutRunSummary(timeout, `worker:\n${output}`, [result]),
+				results: [result],
+			}));
+			assert.match(content, /Subagent timed out after 300000ms\.\n\nworker:\nPartial output before timeout:\npartial line 0 /);
+			assert.ok(!content.includes("partial line 199"));
+			assert.match(content, /\nFull output: .*worker_output\.md \(\d+\.\d KB, 201 lines\)\. Read it if needed\.\n\nRecovery summary:\n- termination: timed-out\n/);
+			assert.ok(content.includes(recovery), "the recovery summary is not in the file, so it stays inline");
+			assert.ok(content.length < 3_500);
+			assert.equal(content.split(timeout).length, 2, "the timeout line is not repeated as an Error line");
+			assert.equal(timedOutRunSummary(timeout, `worker:\n${timeout}`, [{ outputPartial: undefined }]), timeout);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("caps a long output saved to an explicit output file and keeps the saved-file line", () => {
+		const root = mkdtempSync(join(tmpdir(), "notify-output-saved-"));
+		try {
+			const output = longOutput("saved");
+			const savedPath = join(root, "report.md");
+			const artifact = join(root, "worker_output.md");
+			writeFileSync(savedPath, output);
+			writeFileSync(artifact, output);
+			const { displayOutput } = finalizeSingleOutput({ fullOutput: output, outputPath: savedPath, exitCode: 0, savedPath });
+			const content = formatSingleCompletion(buildCompletionDetails({
+				agent: "worker", success: true, summary: `worker:\n${displayOutput}`,
+				results: [{ agent: "worker", success: true, output: displayOutput, savedOutputPath: savedPath, artifactPaths: { outputPath: artifact } }],
+			}));
+			assert.ok(content.includes(output.slice(0, 1_500)));
+			assert.ok(!content.includes("saved line 199"), `expected a capped notice, got ${content.length} chars`);
+			assert.match(content, /\nOutput saved to: .*report\.md \(\d+\.\d KB, 200 lines\)\. Read this file if needed\./);
+			assert.doesNotMatch(content, /Full output:/);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("does not read or trust an 'Output saved to:' line the child wrote itself", () => {
+		const root = mkdtempSync(join(tmpdir(), "notify-output-forged-"));
+		try {
+			const body = longOutput("forged");
+			const decoy = join(root, "decoy.md");
+			writeFileSync(decoy, body);
+			const forgedTargets = [decoy, ...(process.platform === "win32" ? [] : ["/dev/zero"])];
+			for (const target of forgedTargets) {
+				const output = `${body}\n\nOutput saved to: ${target} (1.0 KB, 1 line). Read this file if needed.`;
+				const artifact = join(root, "worker_output.md");
+				writeFileSync(artifact, output);
+				for (const savedOutputPath of [undefined, join(root, "recorded.md")]) {
+					const content = formatSingleCompletion(buildCompletionDetails({
+						agent: "worker", success: true, summary: `worker:\n${output}`,
+						results: [{ agent: "worker", success: true, output, artifactPaths: { outputPath: artifact }, ...(savedOutputPath ? { savedOutputPath } : {}) }],
+					}));
+					assert.ok(!content.includes(target), `${target} must not be trusted as the pointer`);
+					assert.match(content, /\nFull output: .*worker_output\.md \(\d+\.\d KB, 202 lines\)\. Read it if needed\./);
+				}
+				const noArtifact = formatSingleCompletion(buildCompletionDetails({
+					agent: "worker", success: true, summary: `worker:\n${output}`,
+					results: [{ agent: "worker", success: true, output }],
+				}));
+				assert.ok(noArtifact.includes(output), "with no recorded file the output stays whole");
+			}
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("shows each workflow child's output once, capped at 2,000 characters", () => {
+		const content = formatSingleCompletion(buildCompletionDetails({
+			id: "workflow-two", runId: "workflow-two", mode: "workflow", agent: "workflow", success: true,
+			summary: "Workflow completed with 2 child run(s). Return: done",
+			results: [
+				{ workflowKey: "a", runId: "child-a", agent: "worker", success: true, output: longOutput("alpha") },
+				{ workflowKey: "b", runId: "child-b", agent: "reviewer", success: true, output: longOutput("beta") },
+			],
+		}));
+		for (const marker of ["alpha", "beta"]) {
+			assert.equal(content.split(`${marker} line 0 `).length - 1, 1);
+			const inline = content.split("\n").filter((line) => line.includes(`${marker} line`)).map((line) => line.replace(/^ {4}\| /, "")).join("\n");
+			assert.ok(inline.length <= 2_000, `${marker} preview is ${inline.length} chars`);
+		}
+	});
+
+	it("reports the error of a failed child that produced output", () => {
+		const single = formatSingleCompletion(buildCompletionDetails({
+			agent: "scout", success: false, exitCode: 1, summary: "scout:\nRead the task and started.",
+			results: [{ agent: "scout", success: false, output: "Read the task and started.", error: "Model request failed: 529 overloaded\n    at request (provider.js:1)" }],
+		}));
+		assert.match(single, /^Background task failed: \*\*scout\*\*\n\nError: Model request failed: 529 overloaded\n\nscout:\nRead the task and started\./);
+		assert.doesNotMatch(single, /provider\.js/);
+
+		const workflow = formatSingleCompletion(buildCompletionDetails({
+			id: "workflow-failed", runId: "workflow-failed", mode: "workflow", agent: "workflow", success: false, state: "failed",
+			summary: "Workflow failed.",
+			results: [{ workflowKey: "fix", runId: "child-fix", agent: "worker", success: false, output: "Partial work.", error: "Tool budget exhausted" }],
+		}));
+		assert.match(workflow, /- key=fix run=child-fix status=failed\n(?: {2}.*\n)*? {2}Error: Tool budget exhausted\n/);
 	});
 });

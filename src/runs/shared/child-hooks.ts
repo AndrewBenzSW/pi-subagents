@@ -1,21 +1,14 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { listBackgroundWorkProviders } from "../../api/background-work.ts";
 import { ReadonlyDrainObservation } from "./readonly-drain-observation.ts";
 import registerFanoutChildSubagentExtension, { createChildSafeState } from "../../extension/fanout-child.ts";
 import registerSubagentFastModeExtension from "./fast-mode-extension.ts";
-import registerSubagentPromptRuntime from "./subagent-prompt-runtime.ts";
+import registerSubagentPromptRuntime, { registerSubagentPromptBoundary } from "./subagent-prompt-runtime.ts";
+import { structuredOutputValidatorReady } from "./structured-output.ts";
 import type { ChildRuntimeConfig } from "./child-runtime-config.ts";
 import type { ChildToolDiagnostic } from "./tool-availability.ts";
-import type { ChildSessionLaunch } from "./child-session.ts";
-import type { ArbiterModelContext } from "./llm-intent-arbiter.ts";
+import type { ChildHookExtension, ChildSessionLaunch } from "./child-session.ts";
 import type { ChildTranscriptWriter } from "../../shared/child-transcript.ts";
 import { projectRuntimeAcknowledgedExtensions } from "./runtime-acknowledged-extensions.ts";
-
-/** Inline extension shape accepted by pi's resource loader (`extensionFactories`). */
-export interface ChildHookExtension {
-	name: string;
-	factory: (pi: ExtensionAPI) => void;
-}
 
 type OwnedCapture = Required<Pick<ChildRuntimeConfig, "toolDiagnostic" | "runtimeAcknowledgements">>;
 type PromptProof = { config: ChildRuntimeConfig; snapshot: string; factories?: ChildHookExtension["factory"][]; observeNext?: ReadonlyDrainObservation; observation?: ReadonlyDrainObservation; capture?: OwnedCapture; reporting?: { launch: ChildSessionLaunch; callback: ChildSessionLaunch["onExtensionError"] } };
@@ -62,12 +55,10 @@ function readonlyConfig(config: ChildRuntimeConfig, capture?: OwnedCapture): str
 	const keys = dataKeys(config);
 	if (!keys) return undefined;
 	if (capture && (config.toolDiagnostic !== capture.toolDiagnostic || config.runtimeAcknowledgements !== capture.runtimeAcknowledgements)) return undefined;
-	const waitKeys = dataKeys(config.waitTool);
-	if (!waitKeys || waitKeys.some((key) => key !== "enabled")) return undefined;
-	if (config.fast !== false || config.fanoutChild !== false || config.waitTool.enabled !== false) return undefined;
+	if (config.fast !== false || config.fanoutChild !== false) return undefined;
 	for (const key of keys) {
 		const value = Object.getOwnPropertyDescriptor(config, key)!.value;
-		if (["fast", "fanoutChild", "waitTool"].includes(key)) continue;
+		if (["fast", "fanoutChild"].includes(key)) continue;
 		if (capture && (key === "toolDiagnostic" || key === "runtimeAcknowledgements")) continue;
 		if (capture && key === "requiredTools" && Array.isArray(value) && Object.getPrototypeOf(value) === Array.prototype) {
 			const descriptors = Object.getOwnPropertyDescriptors(value);
@@ -128,10 +119,9 @@ export function createChildHooks(config: ChildRuntimeConfig): ChildHookExtension
 }
 
 /** Launch-owned bookkeeping, paired with the same private hook certificate (no callback registration API). */
-export function createCapturedChildHooks(config: ChildRuntimeConfig, runner = false) {
+export function createCapturedChildHooks(config: ChildRuntimeConfig) {
 	let diagnostic: ChildToolDiagnostic | undefined;
 	let acknowledgedIds: string[] | undefined;
-	let completionIntentContext: ArbiterModelContext | undefined;
 	let finalDrainHeld = false;
 	const capture: OwnedCapture = {
 		toolDiagnostic: (value) => { diagnostic = value; },
@@ -139,21 +129,8 @@ export function createCapturedChildHooks(config: ChildRuntimeConfig, runner = fa
 	};
 	Object.assign(config, capture);
 	const hooks = childHooks(config, capture, (held) => { finalDrainHeld = held; });
-	if (runner) {
-		hooks.push({ name: "pi-subagents:completion-intent", factory: (pi) => pi.on("session_start", (_event, childCtx) => {
-			// Retain only attempt model services and the session id string, not the live child session.
-			completionIntentContext = {
-				model: childCtx.model,
-				modelRegistry: childCtx.modelRegistry,
-				sessionId: childCtx.sessionManager.getSessionId(),
-			};
-		}) });
-		const proof = promptProofs.get(hooks[0]!.factory);
-		if (proof) proof.factories = hooks.map((hook) => hook.factory);
-	}
 	return {
 		hooks,
-		completionIntentContext: () => completionIntentContext,
 		toolDiagnostic: () => diagnostic,
 		runtimeAcknowledgedExtensions: () => acknowledgedIds ? projectRuntimeAcknowledgedExtensions(acknowledgedIds) : undefined,
 		finalDrainHeld: () => finalDrainHeld,
@@ -173,17 +150,24 @@ function childHooks(config: ChildRuntimeConfig, capture?: OwnedCapture, holdFina
 	}
 	const hooks: ChildHookExtension[] = [
 		{ name: "pi-subagents:prompt-runtime", factory: function promptRuntime(pi) {
-			if (!proof?.observeNext) return registerSubagentPromptRuntime(pi, runtime);
-			proof.observation = proof.observeNext;
-			proof.observeNext = undefined;
-			registerSubagentPromptRuntime(pi, runtime, proof.observation);
+			if (!proof?.observeNext) {
+				registerSubagentPromptRuntime(pi, runtime);
+			} else {
+				proof.observation = proof.observeNext;
+				proof.observeNext = undefined;
+				registerSubagentPromptRuntime(pi, runtime, proof.observation);
+			}
+			// Pi awaits extension factories, so structured_output's synchronous prepareArguments has its
+			// validator before the model can call it.
+			if (runtime.structuredOutput) return structuredOutputValidatorReady();
 		} },
 	];
+	if (config.fast) hooks.push({ name: "pi-subagents:fast-mode", factory: (pi) => registerSubagentFastModeExtension(pi) });
+	if (config.fanoutChild) hooks.push({ name: "pi-subagents:fanout-child", factory: (pi) => registerFanoutChildSubagentExtension(pi, runtime) });
+	hooks.push({ name: "pi-subagents:prompt-boundary", factory: (pi) => registerSubagentPromptBoundary(pi, runtime) });
 	if (proof) {
 		proof.factories = hooks.map((hook) => hook.factory);
 		promptProofs.set(hooks[0]!.factory, proof);
 	}
-	if (config.fast) hooks.push({ name: "pi-subagents:fast-mode", factory: (pi) => registerSubagentFastModeExtension(pi) });
-	if (config.fanoutChild) hooks.push({ name: "pi-subagents:fanout-child", factory: (pi) => registerFanoutChildSubagentExtension(pi, runtime) });
 	return hooks;
 }

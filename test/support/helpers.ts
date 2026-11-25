@@ -52,7 +52,6 @@ interface AgentConfig {
 	defaultContext?: "fresh" | "fork";
 	systemPrompt?: string;
 	model?: string;
-	fallbackModels?: string[];
 	tools?: string[];
 	extensions?: string[];
 	subagentOnlyExtensions?: string[];
@@ -70,7 +69,6 @@ interface AgentConfig {
 	toolBudget?: { soft?: number; hard: number; block?: string[] | "*" };
 	mcpDirectTools?: string[];
 	maxSubagentDepth?: number;
-	completionGuard?: boolean;
 }
 
 export function makeAgentConfigs(names: string[]): AgentConfig[] {
@@ -105,11 +103,16 @@ interface MinimalCtx {
 	sessionManager: {
 		getSessionId: () => string;
 		getSessionFile: () => string | null;
+		buildContextEntries: () => unknown[];
 	};
 	modelRegistry: {
 		getAvailable: () => Array<{ provider: string; id: string }>;
 	};
 	model?: { provider: string; id?: string };
+}
+
+export function guideTaughtEntries(): unknown[] {
+	return [{ type: "message", message: { role: "toolResult", details: { taught: ["guide"] } } }];
 }
 
 export function makeMinimalCtx(cwd: string): MinimalCtx {
@@ -120,6 +123,7 @@ export function makeMinimalCtx(cwd: string): MinimalCtx {
 		sessionManager: {
 			getSessionId: () => "session-123",
 			getSessionFile: () => null,
+			buildContextEntries: guideTaughtEntries,
 		},
 		modelRegistry: {
 			getAvailable: () => [],
@@ -128,7 +132,6 @@ export function makeMinimalCtx(cwd: string): MinimalCtx {
 }
 
 /**
- * Try to dynamically import a module.
  * - Bare specifiers are imported as-is.
  * - Relative paths (e.g., "./src/shared/utils.ts") are resolved from the project root.
  *
@@ -215,7 +218,7 @@ export const events = {
 				},
 			},
 			{
-				type: "tool_result_end",
+				type: "message_end",
 				message: {
 					role: "toolResult",
 					toolCallId: id,
@@ -237,7 +240,7 @@ export const events = {
 
 	toolResult(toolName: string, text: string, isError = false): object {
 		return {
-			type: "tool_result_end",
+			type: "message_end",
 			message: {
 				role: "toolResult",
 				toolName,
@@ -247,3 +250,9 @@ export const events = {
 		};
 	},
 };
+
+/** Writes a file, creating its folder; recovery descriptors live in a launch folder outside the run folder. */
+export function writeFileCreatingDir(filePath: string, data: string, encoding: BufferEncoding = "utf-8"): void {
+	fs.mkdirSync(path.dirname(filePath), { recursive: true });
+	fs.writeFileSync(filePath, data, encoding);
+}

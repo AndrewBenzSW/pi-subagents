@@ -3,6 +3,8 @@ export type ResolvedRunnerConfig = import("../../shared/types.ts").AgentRunnerCo
 export interface RunnerSubagentStep {
 	/** Session id of the direct parent session for permission-system ask forwarding. */
 	parentSessionId?: string;
+	/** Parent session file, recorded as the new child session's `parentSession` header. */
+	parentSessionFile?: string;
 	/** Resolved opt-in rules for native Pi child tool calls. */
 	permissionRules?: import("./permissions.ts").PermissionRules;
 	agent: string;
@@ -11,7 +13,7 @@ export interface RunnerSubagentStep {
 	task: string;
 	runner?: ResolvedRunnerConfig;
 	/** Herdr saved machine this external-cli step runs on; `cwd` is then the directory on that machine. */
-	machine?: import("../../shared/types.ts").HerdrMachineReference;
+	machine?: import("../../shared/types.ts").PlacementMachineReference;
 	remoteReads?: string[] | false;
 	machineEnv?: Record<string, string>;
 	externalJobFollowUp?: {
@@ -21,7 +23,6 @@ export interface RunnerSubagentStep {
 		requestId: string;
 		requestDigest: string;
 	};
-	/** Resolved launch context for this child. */
 	context?: "fresh" | "fork";
 	importAsyncRoot?: {
 		runId: string;
@@ -40,24 +41,29 @@ export interface RunnerSubagentStep {
 	contextLimit?: number;
 	fast?: boolean;
 	thinking?: string;
+	/** Trailing Claude Code argv for an explicit model/thinking request. */
+	claudeCodeOverrideArgs?: string[];
 	thinkingCeiling?: import("../../shared/model-info.ts").ThinkingLevel;
-	modelCandidates?: string[];
 	requestedModel?: string;
-	skippedModels?: import("../../shared/types.ts").SkippedModel[];
 	/** The primary model is inherited from the parent session and should not be verified against the child-reported active registry model. */
 	skipPrimaryModelVerification?: boolean;
 	modelVerificationRegistry?: Array<{ provider: string; id: string; fullId: string; contextWindow?: number }>;
 	modelResponseAliases?: Record<string, string[]>;
 	tools?: string[];
+	/** Provider of `model` that a parent extension registers; set only when this child loads no ambient extensions. */
+	parentExtensionProvider?: string;
 	excludeTools?: string[];
 	allowNestedSubagents?: boolean;
+	/** Resolved selected-agent policy for launches made by this child. */
+	allowedAgents?: string[];
 	extensions?: string[];
 	subagentOnlyExtensions?: string[];
 	/** Private immutable host policy snapshot serialized to the native runner. */
 	requiredExtensions?: import("../../shared/required-child-extensions.ts").RequiredChildExtensionSnapshot;
 	mcpDirectTools?: string[];
+	/** The parent's resolution of `mcpDirectTools` against Pi's built-in MCP; the runner has no host to repeat it. */
+	builtinMcpTools?: import("./mcp-direct-tool-grant.ts").ResolvedMcpDirectToolSelection[];
 	mutationTools?: string[];
-	completionGuard?: boolean;
 	systemPrompt?: string | null;
 	systemPromptMode?: "append" | "replace";
 	inheritProjectContext: boolean;
@@ -74,8 +80,6 @@ export interface RunnerSubagentStep {
 	timeoutMs?: number;
 	/** Resolved configured hard per-tool-call timeout (ms); fast tools still have a default when undefined. */
 	toolTimeoutMs?: number;
-	waitToolEnabled?: boolean;
-	waitToolDefaultTimeoutMs?: number;
 	structuredOutput?: import("./structured-output.ts").StructuredOutputRuntime;
 	structuredOutputSchema?: import("../../shared/types.ts").JsonSchemaObject;
 	agentContract?: import("../../shared/types.ts").AgentContract;
@@ -245,7 +249,6 @@ export interface ParallelTaskResult {
 	error?: string;
 	timedOut?: boolean;
 	model?: string;
-	attemptedModels?: string[];
 	outputTargetPath?: string;
 	outputTargetExists?: boolean;
 }

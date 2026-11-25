@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { THINKING_LEVELS, type ThinkingLevel } from "../shared/model-info.ts";
 import { getAgentDir, getProjectConfigDir } from "../shared/utils.ts";
+import { withSettingsFileLease } from "../shared/settings-file-lease.ts";
 import {
 	WATCHDOG_WARNING_SEVERITIES,
 	type ResolvedWatchdogConfig,
@@ -111,9 +112,9 @@ const ROLE_MODEL_RULE_FIELDS = new Set(["allow", "deny", "note"]);
 const GUIDANCE_FIELDS = new Set(["watchdogMd"]);
 const SCOPE_FIELDS = new Set(["enabled"]);
 const CADENCE_FIELDS = new Set(["everyNTools"]);
-const ENDPOINT_FIELDS = new Set(["enabled", "model", "fallbackModels", "thinking"]);
-const CHILDREN_FIELDS = new Set(["enabled", "model", "fallbackModels", "thinking", "watchdogTailTimeoutMs", "cadence", "overrides"]);
-const CHILD_OVERRIDE_FIELDS = new Set(["enabled", "model", "fallbackModels", "thinking", "cadence"]);
+const ENDPOINT_FIELDS = new Set(["enabled", "model", "thinking"]);
+const CHILDREN_FIELDS = new Set(["enabled", "model", "thinking", "watchdogTailTimeoutMs", "cadence", "overrides"]);
+const CHILD_OVERRIDE_FIELDS = new Set(["enabled", "model", "thinking", "cadence"]);
 const LSP_FIELDS = new Set(["enabled", "timeoutMs", "maxFiles", "maxDiagnostics"]);
 
 function cloneDefaultConfig(): ResolvedWatchdogConfig {
@@ -221,7 +222,6 @@ function parseEndpointPatch(value: unknown, field: string, meta: ParseMeta): Wat
 	const input = parseObject(value, field, meta);
 	assertKnownFields(input, ENDPOINT_FIELDS, field, meta);
 	const patch: WatchdogEndpointPatch = {};
-	if ("fallbackModels" in input) patch.fallbackModels = parseStringList(input.fallbackModels, `${field}.fallbackModels`, meta);
 	if ("enabled" in input) patch.enabled = parseBoolean(input.enabled, `${field}.enabled`, meta);
 	if ("model" in input) patch.model = parseNonEmptyString(input.model, `${field}.model`, meta);
 	if ("thinking" in input) patch.thinking = parseThinking(input.thinking, `${field}.thinking`, meta);
@@ -232,7 +232,6 @@ function parseChildOverridePatch(value: unknown, field: string, meta: ParseMeta)
 	const input = parseObject(value, field, meta);
 	assertKnownFields(input, CHILD_OVERRIDE_FIELDS, field, meta);
 	const patch: WatchdogChildOverridePatch = {};
-	if ("fallbackModels" in input) patch.fallbackModels = parseStringList(input.fallbackModels, `${field}.fallbackModels`, meta);
 	if ("enabled" in input) patch.enabled = parseBoolean(input.enabled, `${field}.enabled`, meta);
 	if ("model" in input) patch.model = parseNonEmptyString(input.model, `${field}.model`, meta);
 	if ("thinking" in input) patch.thinking = parseThinking(input.thinking, `${field}.thinking`, meta);
@@ -244,7 +243,6 @@ function parseChildrenPatch(value: unknown, field: string, meta: ParseMeta): Wat
 	const input = parseObject(value, field, meta);
 	assertKnownFields(input, CHILDREN_FIELDS, field, meta);
 	const patch: WatchdogChildrenPatch = {};
-	if ("fallbackModels" in input) patch.fallbackModels = parseStringList(input.fallbackModels, `${field}.fallbackModels`, meta);
 	if ("enabled" in input) patch.enabled = parseBoolean(input.enabled, `${field}.enabled`, meta);
 	if ("model" in input) patch.model = parseNonEmptyString(input.model, `${field}.model`, meta);
 	if ("thinking" in input) patch.thinking = parseThinking(input.thinking, `${field}.thinking`, meta);
@@ -464,24 +462,28 @@ function writeSettingsFile(settingsPath: string, settings: Record<string, unknow
 export function writeUserWatchdogEnabled(enabled: boolean): string {
 	const settingsPath = getUserSettingsPath();
 	const meta: ParseMeta = { scope: "user", path: settingsPath };
-	const settings = readSettingsFileStrict(settingsPath);
-	const watchdog = ensureWatchdogSettings(settings, meta);
-	watchdog.enabled = enabled;
-	targetSettingsObject(watchdog, { kind: "main" }, meta).enabled = enabled;
-	return writeSettingsFile(settingsPath, settings);
+	return withSettingsFileLease(settingsPath, () => {
+		const settings = readSettingsFileStrict(settingsPath);
+		const watchdog = ensureWatchdogSettings(settings, meta);
+		watchdog.enabled = enabled;
+		targetSettingsObject(watchdog, { kind: "main" }, meta).enabled = enabled;
+		return writeSettingsFile(settingsPath, settings);
+	});
 }
 
 export function writeWatchdogModelSettings(input: WatchdogModelSettingsWrite): string {
 	const settingsPath = settingsPathForWrite(input.scope, input.cwd);
 	const meta: ParseMeta = { scope: input.scope, path: settingsPath };
-	const settings = readSettingsFileStrict(settingsPath);
-	const watchdog = ensureWatchdogSettings(settings, meta);
-	const target = targetSettingsObject(watchdog, input.target, meta);
-	if (input.model === null) delete target.model;
-	else if (input.model !== undefined) target.model = input.model;
-	if (input.thinking === null) delete target.thinking;
-	else if (input.thinking !== undefined) target.thinking = input.thinking;
-	return writeSettingsFile(settingsPath, settings);
+	return withSettingsFileLease(settingsPath, () => {
+		const settings = readSettingsFileStrict(settingsPath);
+		const watchdog = ensureWatchdogSettings(settings, meta);
+		const target = targetSettingsObject(watchdog, input.target, meta);
+		if (input.model === null) delete target.model;
+		else if (input.model !== undefined) target.model = input.model;
+		if (input.thinking === null) delete target.thinking;
+		else if (input.thinking !== undefined) target.thinking = input.thinking;
+		return writeSettingsFile(settingsPath, settings);
+	});
 }
 
 export function resolveWatchdogConfig(cwd: string, options: { session?: Record<string, unknown> } = {}): WatchdogSettingsResult {

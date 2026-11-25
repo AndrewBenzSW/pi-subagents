@@ -1,9 +1,8 @@
 import { Agent, type AgentTool, type StreamFn, type ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { createReadOnlyTools, convertToLlm, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { streamSimple } from "@earendil-works/pi-ai/compat";
 import type { Model, ProviderHeaders } from "@earendil-works/pi-ai";
 import { Type, type Static } from "typebox";
-import { buildModelCandidates, isContextOverflow, isRetryableModelFailureAttempt, resolveModelCandidate } from "../runs/shared/model-fallback.ts";
+import { knownModelProviders, resolveModelCandidate } from "../runs/shared/model-resolution.ts";
 import { agentStreamOptions } from "../shared/agent-stream-options.ts";
 import { opencodeSessionHeaders } from "../shared/opencode-session-headers.ts";
 import { resolveEffectiveThinking, splitKnownThinkingSuffix, THINKING_LEVELS, toModelInfo } from "../shared/model-info.ts";
@@ -57,7 +56,7 @@ export interface CreateMainWatchdogReviewOptions {
 	streamFn?: StreamFn;
 	createReadOnlyTools?: (cwd: string) => AgentTool[];
 	getThinkingLevel?: () => ThinkingLevel | undefined;
-	diffBaseline?: () => WatchdogDiffBaseline | undefined;
+	diffBaseline?: () => Promise<WatchdogDiffBaseline | undefined> | undefined;
 }
 
 function fullModelId(model: Pick<RegistryModel, "provider" | "id">): string {
@@ -99,7 +98,7 @@ function resolveReviewThinking(input: {
 function resolveConfiguredModel(ctx: ExtensionContext, rawModel: string): { model: RegistryModel; modelString: string } {
 	const availableModels = ctx.modelRegistry.getAvailable().map(toModelInfo);
 	const preferredProvider = typeof ctx.model?.provider === "string" ? ctx.model.provider : undefined;
-	const resolved = resolveModelCandidate(rawModel, availableModels, preferredProvider);
+	const resolved = resolveModelCandidate(rawModel, availableModels, preferredProvider, knownModelProviders(ctx.modelRegistry));
 	if (!resolved) {
 		throw new Error(`Configured watchdog model '${rawModel}' did not match exactly one authenticated available model. Use provider/model or configure credentials for the intended provider.`);
 	}
@@ -218,11 +217,15 @@ function createWatchdogWarnTool(request: WatchdogReviewRequest): AgentTool<typeo
 	};
 }
 
-export function buildWatchdogSystemPrompt(ctx: Pick<ExtensionContext, "cwd">, options: { hasScope?: boolean; guidance?: string; hasDiff?: boolean } = {}): string {
+export function formatWatchdogCwdSection(cwd: string): string {
+	if (/[\p{Cc}\p{Zl}\p{Zp}<>]/u.test(cwd)) throw new Error("Watchdog cwd cannot contain control, line-separator, or angle-bracket characters.");
+	return `<cwd>\n${cwd}\n</cwd>`;
+}
+
+function buildWatchdogSystemPrompt(ctx: Pick<ExtensionContext, "cwd">, options: { hasScope?: boolean; guidance?: string; hasDiff?: boolean } = {}): string {
 	const guidance = options.guidance?.trim();
 	return [
 		"You are the main-session subagent watchdog for Pi.",
-		`Working directory: ${ctx.cwd}`,
 		"Review only the supplied parent turn delta. Inspect repository files only when needed to verify a concrete concern.",
 		options.hasScope ? "Use the Current scope record alongside supplied activity evidence; an unrelated user question does not cancel older authorized work." : undefined,
 		`You are read-only. You may use ${options.hasDiff ? "read, grep, find, ls, and watchdog_diff (the full repo diff since the session baseline; pass a path to narrow it)" : "read, grep, find, and ls"}. Do not edit files, run shell commands, spawn agents, or mutate state.`,
@@ -232,6 +235,7 @@ export function buildWatchdogSystemPrompt(ctx: Pick<ExtensionContext, "cwd">, op
 		"If the turn is clean, call no tools and end normally.",
 		"Use severity='blocker' only when the issue should stop acceptance until addressed; otherwise use severity='concern'.",
 		guidance ? `\nStanding instructions from WATCHDOG.md (project first, then user):\n${guidance}` : undefined,
+		`\n${formatWatchdogCwdSection(ctx.cwd)}`,
 	].filter((line): line is string => Boolean(line)).join("\n");
 }
 
@@ -256,45 +260,24 @@ export function createMainWatchdogReview(provider: WatchdogContextProvider, opti
 		if (!ctx) throw new Error("Main watchdog review cannot run without an active Pi extension context.");
 		const aborted = () => ctx.signal?.aborted || request.signal?.aborted;
 		if (aborted()) return { stopReason: "aborted" };
-		const inherited = !request.config.main.model && ctx.model ? fullModelId(ctx.model) : undefined;
-		const candidates = request.config.main.fallbackModels?.length
-			? buildModelCandidates(request.config.main.model ?? inherited, request.config.main.fallbackModels,
-				ctx.modelRegistry.getAvailable().map(toModelInfo), ctx.model?.provider, { primaryModelFromParent: Boolean(inherited) })
-				.candidates
-			: [request.config.main.model];
-		for (let index = 0; index < candidates.length; index++) {
-			if (aborted()) return { stopReason: "aborted" };
-			const candidate = candidates[index];
-			const config = { ...request.config, main: { ...request.config.main, model: candidate === inherited ? undefined : candidate } };
-			try {
-				const attempt = await runWatchdogAttempt(ctx, { ...request, config }, options);
-				if (aborted()) return { stopReason: "aborted" };
-				if (!attempt.retryable || index === candidates.length - 1) return attempt.result;
-			} catch (error) {
-				if (aborted()) return { stopReason: "aborted" };
-				if (!(error instanceof WatchdogAuthError)) throw error;
-				if (isContextOverflow(error.message) || !isRetryableModelFailureAttempt({ error: error.message }) || index === candidates.length - 1) throw error.cause ?? error;
-			}
+		try {
+			return (await runWatchdogAttempt(ctx, request, options)).result;
+		} catch (error) {
+			if (error instanceof WatchdogAuthError) throw error.cause ?? error;
+			throw error;
 		}
-		throw new Error("No usable watchdog model candidates.");
 	};
 }
 
 async function runWatchdogAttempt(ctx: ExtensionContext, request: WatchdogReviewRequest, options: CreateMainWatchdogReviewOptions): Promise<{
 	result: Awaited<ReturnType<WatchdogReviewFunction>>;
-	retryable?: boolean;
 }> {
 	const selection = await resolveWatchdogReviewModel(ctx, request.config, {
 		currentThinkingLevel: options.getThinkingLevel?.(),
 	});
 	if (ctx.signal?.aborted || request.signal?.aborted) return { result: { stopReason: "aborted" } };
 	const auth = selection.auth;
-	const registeredProvider = (ctx.modelRegistry as {
-		getRegisteredProviderConfig?: (provider: string) => { api?: string; streamSimple?: StreamFn } | undefined;
-	}).getRegisteredProviderConfig?.(selection.model.provider);
-	const baseStreamFn = options.streamFn ?? (registeredProvider?.streamSimple && registeredProvider.api === selection.model.api
-		? registeredProvider.streamSimple
-		: streamSimple);
+	const baseStreamFn: StreamFn = options.streamFn ?? ((model, context, streamOptions) => ctx.modelRegistry.streamSimple(model, context, streamOptions));
 	const sessionId = ctx.sessionManager.getSessionId();
 	const streamFn: StreamFn = (model, context, streamOptions) => {
 		// Agent may enter one final loop iteration after an aborted mixed tool batch.
@@ -307,7 +290,7 @@ async function runWatchdogAttempt(ctx: ExtensionContext, request: WatchdogReview
 			headers: { ...opencodeSessionHeaders(model, sessionId), ...(streamOptions?.headers ?? {}), ...(auth.headers ?? {}) },
 		});
 	};
-	const diffBaseline = options.diffBaseline?.();
+	const diffBaseline = await options.diffBaseline?.();
 	let clarification: { question: string; evidence: string } | undefined;
 	let warned = false;
 	let toolCount = 0;
@@ -337,13 +320,15 @@ async function runWatchdogAttempt(ctx: ExtensionContext, request: WatchdogReview
 			return { content: [{ type: "text", text: "Review yielded for clarification." }], details: {} };
 		},
 	});
+	const systemPrompt = buildWatchdogSystemPrompt(ctx, {
+		hasScope: request.hasScope,
+		guidance: loadWatchdogGuidance(ctx.cwd, request.config.guidance.watchdogMd),
+		hasDiff: diffBaseline !== undefined,
+	});
 	const agent = new Agent({
+		sessionId,
 		initialState: {
-			systemPrompt: buildWatchdogSystemPrompt(ctx, {
-				hasScope: request.hasScope,
-				guidance: loadWatchdogGuidance(ctx.cwd, request.config.guidance.watchdogMd),
-				hasDiff: diffBaseline !== undefined,
-			}),
+			systemPrompt,
 			model: selection.model,
 			thinkingLevel: selection.thinkingLevel,
 			tools,
@@ -375,6 +360,5 @@ async function runWatchdogAttempt(ctx: ExtensionContext, request: WatchdogReview
 	const error = terminal && "errorMessage" in terminal && typeof terminal.errorMessage === "string" ? terminal.errorMessage : undefined;
 	return {
 		result: clarification ? { clarification } : error ? { stopReason, errorMessage: error } : { stopReason },
-		retryable: !clarification && stopReason === "error" && !isContextOverflow(error) && isRetryableModelFailureAttempt({ error, messages: agent.state.messages, toolCount }),
 	};
 }

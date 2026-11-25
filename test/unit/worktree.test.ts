@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
@@ -22,6 +23,10 @@ import {
 	WorktreeSetupError,
 	type WorktreeSetup,
 } from "../../src/runs/shared/worktree.ts";
+import { formatParallelHandoffReference, writeParallelHandoffGroup } from "../../src/runs/shared/parallel-handoff.ts";
+
+const require = createRequire(import.meta.url);
+const fsCjs = require("node:fs") as typeof fs;
 
 function git(cwd: string, args: string[]): string {
 	const result = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf-8" });
@@ -319,6 +324,16 @@ console.log(JSON.stringify({ action: "created", branch, path: repo, created_bran
 		assert.equal(buildWorktreeNaming({ runId: "run", index: 0, agent: "worker", task: "Fix\nAPI" }).label, "worker-Fix API");
 		assert.equal(normalizeWorktreeBranchPrefix("pi-custom/"), "pi-custom/");
 		assert.throws(() => normalizeWorktreeBranchPrefix("../unsafe"), /invalid/i);
+	});
+
+	it("keeps naming labels within the 256-byte cap when truncation splits a multi-byte character", () => {
+		for (let pad = 0; pad < 8; pad++) {
+			const task = `${"x".repeat(pad)}${"审".repeat(120)} tail`;
+			const naming = buildWorktreeNaming({ runId: "run", index: 0, agent: "worker", task });
+			const labelBytes = Buffer.byteLength(naming.label, "utf-8");
+			assert.ok(labelBytes <= 256, `label must fit the 256-byte cap, got ${labelBytes} (pad=${pad})`);
+			assert.ok(!naming.label.endsWith("\uFFFD"), `label must not end with U+FFFD (pad=${pad})`);
+		}
 	});
 
 	it("createWorktrees maps subdirectory cwd to each agentCwd", async () => {
@@ -704,9 +719,16 @@ console.log(JSON.stringify({ action: "created", branch, path: repo, created_bran
 		const repoDir = createRepo("pi-worktree-dirty-");
 		try {
 			fs.writeFileSync(path.join(repoDir, "tracked.txt"), "dirty\n", "utf-8");
+			fs.writeFileSync(path.join(repoDir, "scratch.md"), "new\n", "utf-8");
 			await assert.rejects(
 				() => createWorktrees(repoDir, "dirty", 1, { baseRef: "unsafe..ref" }),
-				/worktree isolation requires a clean git working tree/i,
+				(error: Error) => {
+					assert.match(error.message, /worktree isolation requires a clean git working tree: .+ has 2 uncommitted change\(s\):/);
+					assert.ok(error.message.includes(path.basename(repoDir)), error.message);
+					assert.match(error.message, /^ {2} M tracked\.txt$/m);
+					assert.match(error.message, /^ {2}\?\? scratch\.md$/m);
+					return true;
+				},
 			);
 		} finally {
 			cleanupRepo(repoDir);
@@ -1052,9 +1074,48 @@ process.stdout.write("corrupt external diff output\\n");
 		}
 	});
 
-	it("createWorktrees creates node_modules symlink when node_modules exists", {
-		skip: process.platform === "win32" ? "Symlink behavior differs on Windows CI environments." : undefined,
-	}, async () => {
+	it("keeps a branch whose commits are on no other ref and reports it in the handoff", async () => {
+		const repoDir = createRepo("pi-worktree-kept-branch-");
+		let setup: WorktreeSetup | undefined;
+		try {
+			setup = await createWorktrees(repoDir, "kept-branch", 2);
+			const [only, landed] = setup.worktrees as [WorktreeSetup["worktrees"][number], WorktreeSetup["worktrees"][number]];
+			const commit = (worktreePath: string, name: string): string => {
+				fs.writeFileSync(path.join(worktreePath, name), `${name}\n`, "utf-8");
+				git(worktreePath, ["add", name]);
+				git(worktreePath, ["commit", "-m", name]);
+				return git(worktreePath, ["rev-parse", "HEAD"]);
+			};
+			const onlyTip = commit(only.path, "only.txt");
+			git(repoDir, ["branch", "landed-copy", commit(landed.path, "landed.txt")]);
+			const diffs = diffWorktrees(setup, ["worker", "worker"], path.join(repoDir, "artifacts", "patches"));
+			const handoff = {
+				manifestPath: path.join(repoDir, "artifacts", "handoff.json"), runId: "run-kept", mode: "parallel" as const, source: "foreground" as const,
+				cwd: repoDir, stepIndex: 0, flatStartIndex: 0, setup, diffs,
+				results: [{ agent: "worker", status: "completed" as const, summary: "done" }, { agent: "worker", status: "completed" as const, summary: "done" }],
+			};
+			writeParallelHandoffGroup(handoff);
+
+			const cleanup = cleanupWorktrees(setup, { kind: "preserve", capturedDiffs: diffs, handoffManifestPath: handoff.manifestPath });
+			setup = undefined;
+			assert.equal(cleanup.state, "complete");
+			assert.deepEqual(cleanup.tasks.map(({ worktreeRemoved, branchRemoved, keptBranchTip, preserved, errors }) => ({ worktreeRemoved, branchRemoved, keptBranchTip, preserved, errors })), [
+				{ worktreeRemoved: true, branchRemoved: false, keptBranchTip: onlyTip, preserved: undefined, errors: undefined },
+				{ worktreeRemoved: true, branchRemoved: true, keptBranchTip: undefined, preserved: undefined, errors: undefined },
+			]);
+			assert.equal(git(repoDir, ["rev-parse", `refs/heads/${only.branch}`]), onlyTip);
+			assert.equal(git(repoDir, ["branch", "--list", landed.branch]), "");
+
+			const reference = writeParallelHandoffGroup({ ...handoff, cleanup });
+			assert.equal(reference.cleanupState, "complete");
+			assert.ok(formatParallelHandoffReference(reference).includes(`Kept branch ${only.branch} at ${onlyTip.slice(0, 12)}: its commits are on no other branch.`));
+		} finally {
+			if (setup) cleanupWorktrees(setup, { kind: "setup-rollback" });
+			cleanupRepo(repoDir);
+		}
+	});
+
+	it("createWorktrees creates node_modules link when node_modules exists", async () => {
 		const repoDir = createRepo("pi-worktree-node-modules-");
 		const nodeModulesDir = path.join(repoDir, "node_modules");
 		fs.mkdirSync(nodeModulesDir, { recursive: true });
@@ -1066,11 +1127,161 @@ process.stdout.write("corrupt external diff output\\n");
 			const symlinkPath = path.join(setup.worktrees[0]!.path, "node_modules");
 			assert.equal(setup.worktrees[0]!.nodeModulesLinked, true);
 			assert.deepEqual(setup.worktrees[0]!.syntheticPaths, ["node_modules"]);
-			assert.ok(fs.existsSync(symlinkPath), "node_modules link should exist");
 			assert.equal(fs.lstatSync(symlinkPath).isSymbolicLink(), true, "node_modules should be a symlink");
-			assert.equal(fs.realpathSync(symlinkPath), fs.realpathSync(nodeModulesDir));
+			assert.equal(fs.realpathSync.native(symlinkPath), fs.realpathSync.native(nodeModulesDir));
 		} finally {
 			if (setup) cleanupWorktrees(setup);
+			cleanupRepo(repoDir);
+		}
+	});
+
+	it("preserves a dangling node_modules destination", {
+		skip: process.platform === "win32" ? "Git symlink behavior differs on Windows CI environments." : undefined,
+	}, async () => {
+		const repoDir = createRepo("pi-worktree-dangling-node-modules-");
+		const sourceModulesName = ".source-dependencies";
+		fs.mkdirSync(path.join(repoDir, sourceModulesName));
+		fs.appendFileSync(path.join(repoDir, ".git", "info", "exclude"), `${sourceModulesName}/\n`);
+		fs.symlinkSync(sourceModulesName, path.join(repoDir, "node_modules"));
+		git(repoDir, ["add", "node_modules", "-f"]);
+		git(repoDir, ["commit", "-m", "track environment-relative node_modules symlink"]);
+
+		let setup: WorktreeSetup | undefined;
+		try {
+			setup = await createWorktrees(repoDir, `dangling-node-modules-${process.pid}`, 1);
+			const destination = path.join(setup.worktrees[0]!.path, "node_modules");
+			assert.equal(fs.lstatSync(destination).isSymbolicLink(), true);
+			assert.equal(fs.existsSync(destination), false, "tracked destination should be dangling in the managed worktree");
+			assert.equal(fs.readlinkSync(destination), sourceModulesName);
+			assert.equal(setup.worktrees[0]!.nodeModulesLinked, false);
+			assert.deepEqual(setup.worktrees[0]!.syntheticPaths, []);
+		} finally {
+			if (setup) cleanupWorktrees(setup, { kind: "setup-rollback" });
+			cleanupRepo(repoDir);
+		}
+	});
+
+	it("preserves a tracked node_modules destination before validating the source", async () => {
+		const repoDir = createRepo("pi-worktree-tracked-node-modules-file-");
+		fs.writeFileSync(path.join(repoDir, "node_modules"), "tracked destination\n", "utf-8");
+		git(repoDir, ["add", "node_modules"]);
+		git(repoDir, ["commit", "-m", "track node_modules file"]);
+
+		let setup: WorktreeSetup | undefined;
+		try {
+			setup = await createWorktrees(repoDir, "tracked-node-modules-file", 1);
+			const destination = path.join(setup.worktrees[0]!.path, "node_modules");
+			assert.equal(fs.readFileSync(destination, "utf-8").trim(), "tracked destination");
+			assert.equal(setup.worktrees[0]!.nodeModulesLinked, false);
+			assert.deepEqual(setup.worktrees[0]!.syntheticPaths, []);
+		} finally {
+			if (setup) cleanupWorktrees(setup, { kind: "setup-rollback" });
+			cleanupRepo(repoDir);
+		}
+	});
+
+	it("treats a dangling source node_modules as absent", {
+		skip: process.platform === "win32" ? "Creating a dangling directory symlink requires elevated privileges on Windows." : undefined,
+	}, async () => {
+		const repoDir = createRepo("pi-worktree-dangling-source-node-modules-");
+		fs.appendFileSync(path.join(repoDir, ".git", "info", "exclude"), "/node_modules\n");
+		fs.symlinkSync("missing-source-dependencies", path.join(repoDir, "node_modules"));
+
+		let setup: WorktreeSetup | undefined;
+		try {
+			setup = await createWorktrees(repoDir, `dangling-source-node-modules-${process.pid}`, 1);
+			const destination = path.join(setup.worktrees[0]!.path, "node_modules");
+			assert.equal(fs.lstatSync(path.join(repoDir, "node_modules")).isSymbolicLink(), true);
+			assert.equal(fs.existsSync(destination), false);
+			assert.equal(setup.worktrees[0]!.nodeModulesLinked, false);
+			assert.deepEqual(setup.worktrees[0]!.syntheticPaths, []);
+		} finally {
+			if (setup) cleanupWorktrees(setup, { kind: "setup-rollback" });
+			cleanupRepo(repoDir);
+		}
+	});
+
+	it("adds dependency paths and cause when source inspection fails", async () => {
+		const repoDir = createRepo("pi-worktree-node-modules-probe-failure-");
+		const nodeModulesDir = path.join(repoDir, "node_modules");
+		fs.mkdirSync(nodeModulesDir);
+		const originalStatSync = fsCjs.statSync;
+		let attemptedSource: string | undefined;
+		try {
+			fsCjs.statSync = ((candidate, ...args) => {
+				if (path.basename(String(candidate)) === "node_modules") {
+					attemptedSource = String(candidate);
+					const error = new Error("permission denied during source inspection") as NodeJS.ErrnoException;
+					error.code = "EACCES";
+					throw error;
+				}
+				return originalStatSync(candidate, ...args);
+			}) as typeof fsCjs.statSync;
+			syncBuiltinESMExports();
+
+			await assert.rejects(() => createWorktrees(repoDir, "node-modules-probe-failure", 1), (error: unknown) => {
+				assert.ok(error instanceof WorktreeSetupError);
+				assert.match(error.message, /failed to link node_modules/);
+				assert.match(error.message, /EACCES/);
+				assert.ok(attemptedSource);
+				assert.ok(error.message.includes(attemptedSource));
+				const task = error.snapshot.cleanup?.tasks[0];
+				assert.ok(task);
+				assert.ok(error.message.includes(path.join(task.path, "node_modules")));
+				assert.ok(error.cause instanceof Error && error.cause.cause instanceof Error);
+				assert.equal((error.cause.cause as NodeJS.ErrnoException).code, "EACCES");
+				assert.equal(error.snapshot.cleanup?.state, "complete");
+				assert.equal(task.worktreeRemoved, true);
+				assert.equal(task.branchRemoved, true);
+				assert.equal(fs.existsSync(task.path), false);
+				assert.equal(git(repoDir, ["branch", "--list", task.branch]), "");
+				return true;
+			});
+		} finally {
+			fsCjs.statSync = originalStatSync;
+			syncBuiltinESMExports();
+			cleanupRepo(repoDir);
+		}
+	});
+
+	it("rejects and compensates when node_modules link creation fails", async () => {
+		const repoDir = createRepo("pi-worktree-node-modules-failure-");
+		const nodeModulesDir = path.join(repoDir, "node_modules");
+		fs.mkdirSync(nodeModulesDir);
+		const originalSymlinkSync = fsCjs.symlinkSync;
+		let attemptedSource: string | undefined;
+		let attemptedDestination: string | undefined;
+		try {
+			fsCjs.symlinkSync = ((target, destination) => {
+				attemptedSource = String(target);
+				attemptedDestination = String(destination);
+				const error = new Error("operation not permitted") as NodeJS.ErrnoException;
+				error.code = "EPERM";
+				throw error;
+			}) as typeof fsCjs.symlinkSync;
+			syncBuiltinESMExports();
+
+			await assert.rejects(() => createWorktrees(repoDir, "node-modules-failure", 1), (error: unknown) => {
+				assert.ok(error instanceof WorktreeSetupError);
+				assert.match(error.message, /failed to link node_modules/);
+				assert.match(error.message, /EPERM/);
+				assert.ok(attemptedSource);
+				assert.ok(error.message.includes(attemptedSource));
+				assert.ok(attemptedDestination);
+				assert.ok(error.message.includes(attemptedDestination));
+				assert.ok(error.cause instanceof Error && error.cause.cause instanceof Error);
+				assert.equal((error.cause.cause as NodeJS.ErrnoException).code, "EPERM");
+				assert.equal(error.snapshot.cleanup?.state, "complete");
+				const task = error.snapshot.cleanup?.tasks[0];
+				assert.equal(task?.worktreeRemoved, true);
+				assert.equal(task?.branchRemoved, true);
+				assert.equal(fs.existsSync(task!.path), false);
+				assert.equal(git(repoDir, ["branch", "--list", task!.branch]), "");
+				return true;
+			});
+		} finally {
+			fsCjs.symlinkSync = originalSymlinkSync;
+			syncBuiltinESMExports();
 			cleanupRepo(repoDir);
 		}
 	});

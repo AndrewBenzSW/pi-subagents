@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import * as path from "node:path";
 import { listAsyncRuns, type AsyncRunSummary } from "./async-status.ts";
 import { readAsyncRecoveryDescriptor } from "./async-resume.ts";
 import type { TokenUsage } from "../../shared/types.ts";
@@ -56,7 +57,7 @@ function childResumability(run: AsyncRunSummary, step: AsyncRunSummary["steps"][
 	if (session.state === "not-resumable") return session;
 	let recoveryDescriptor: ReturnType<typeof readAsyncRecoveryDescriptor>;
 	try {
-		recoveryDescriptor = readAsyncRecoveryDescriptor(run.asyncDir);
+		recoveryDescriptor = readAsyncRecoveryDescriptor(path.dirname(run.asyncDir), path.basename(run.asyncDir));
 		if (!recoveryDescriptor) return { state: "not-resumable", reason: "missing recovery descriptor" };
 		if (recoveryDescriptor.sourceRunId !== run.id) return { state: "not-resumable", reason: `recovery descriptor belongs to run ${recoveryDescriptor.sourceRunId}` };
 		if (recoveryDescriptor.agent !== step.agent) return { state: "not-resumable", reason: `recovery descriptor belongs to agent ${recoveryDescriptor.agent}` };
@@ -65,7 +66,7 @@ function childResumability(run: AsyncRunSummary, step: AsyncRunSummary["steps"][
 	}
 	let requiredCwd: string | undefined;
 	try {
-		requiredCwd = resolveRetainedWorktreeCwd(parallelHandoffPath(run.asyncDir), run.id, step.index) ?? recoveryDescriptor.cwd ?? run.cwd;
+		requiredCwd = resolveRetainedWorktreeCwd(parallelHandoffPath(run.asyncDir), run.id, step.index, step.worktreePath) ?? recoveryDescriptor.cwd ?? run.cwd;
 		if (!requiredCwd || !fs.statSync(requiredCwd).isDirectory()) return { state: "not-resumable", reason: `required cwd is missing: ${requiredCwd ?? "unknown"}` };
 	} catch (error) {
 		return { state: "not-resumable", reason: `resume dependency unavailable: ${error instanceof Error ? error.message : String(error)}` };
@@ -81,7 +82,7 @@ function boundedTaskSummary(value: string | undefined): string {
 }
 
 export function listRetainedChildren(asyncDirRoot: string, sessionId: string): RetainedChild[] {
-	const children = listAsyncRuns(asyncDirRoot, { sessionId, states: ["complete", "failed", "paused", "stopped"], entryLimit: MAX_RETAINED_CHILD_CANDIDATES, reconcile: false })
+	const children = listAsyncRuns(asyncDirRoot, { sessionId, states: ["complete", "failed", "paused", "stopped"], entryLimit: MAX_RETAINED_CHILD_CANDIDATES, reconcile: false, includeNested: false })
 		.flatMap((run) => {
 			if (!run.parentWorkflowRunId || run.steps.length !== 1) return [];
 			if (!isRetainedChildState(run.state)) return [];
@@ -108,7 +109,8 @@ export function listRetainedChildren(asyncDirRoot: string, sessionId: string): R
 }
 
 export function formatRetainedChildren(children: RetainedChild[]): string {
-	if (children.length === 0) return "No retained workflow children in the active parent session. If a retained-writer challenge is required, launch a same-role fallback challenge and label it as fallback.";
+	const noKnownEligibleTargetGuidance = 'children.list is workflow-only and is not an exhaustive list of direct native children. If the exact run id of the intended child is known, inspect it with subagent({ action: "status", id: "..." }); if status identifies the candidate, attempt subagent({ action: "resume", id: "...", message: "..." }), which authoritatively checks eligibility and may reject it. Launch a same-role fallback challenge, labeled as fallback, only when there is no known candidate or resume rejects eligibility.';
+	if (children.length === 0) return `No retained workflow children in the active parent session. ${noKnownEligibleTargetGuidance}`;
 	const retained = children.slice(0, MAX_RETAINED_CHILDREN);
 	if (!retained.some((child) => child.resumability.state === "resumable")) {
 		const resumable = children.slice(MAX_RETAINED_CHILDREN).find((child) => child.resumability.state === "resumable");
@@ -130,6 +132,6 @@ export function formatRetainedChildren(children: RetainedChild[]): string {
 			] : []),
 			...(child.tokenTotals ? [`  tokens: input ${child.tokenTotals.input}, output ${child.tokenTotals.output}, total ${child.tokenTotals.total}`] : []),
 		]),
-		...(hasResumableChild ? [] : ["No resumable retained child is listed. Launch a same-role fallback challenge and label it as fallback."]),
+		...(hasResumableChild ? [] : [`No resumable retained workflow child is listed. ${noKnownEligibleTargetGuidance}`]),
 	].join("\n");
 }

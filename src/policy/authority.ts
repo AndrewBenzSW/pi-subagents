@@ -5,6 +5,8 @@ export const AUTHORITY_ACTIONS = [
 	"scheduleCreate",
 	"stopRun",
 	"steerRun",
+	"inspectorOpen",
+	"projectOpen",
 ] as const;
 
 export type AuthorityAction = typeof AUTHORITY_ACTIONS[number];
@@ -18,6 +20,8 @@ const DEFAULT_AUTHORITY_POLICY: Record<AuthorityAction, AuthorityDecision> = {
 	scheduleCreate: "auto",
 	stopRun: "auto",
 	steerRun: "auto",
+	inspectorOpen: "auto",
+	projectOpen: "confirm",
 };
 
 export function resolveAuthorityDecision(input: {
@@ -25,6 +29,26 @@ export function resolveAuthorityDecision(input: {
 	policy?: AuthorityPolicyConfig;
 }): AuthorityDecision {
 	return input.policy?.[input.action] ?? DEFAULT_AUTHORITY_POLICY[input.action];
+}
+
+const MANAGEMENT_ACTION_AUTHORITY: Readonly<Record<string, AuthorityAction>> = {
+	"worktree.cleanup": "discardWorktree",
+	"worktree.discard": "discardWorktree",
+	"grant-spawn-budget": "spawnBudgetGrant",
+	stop: "stopRun",
+	"command.cancel": "stopRun",
+	steer: "steerRun",
+	"command.yield": "steerRun",
+	"schedule.create": "scheduleCreate",
+	"inspector.open": "inspectorOpen",
+	"project.open": "projectOpen",
+};
+
+/** The authority a `subagent` management action needs and its decision; `worktree.cleanup` needs one only with mode "apply". */
+export function managementActionAuthority(action: string, mode: unknown, policy: AuthorityPolicyConfig | undefined): { authority: AuthorityAction; decision: AuthorityDecision } | undefined {
+	if (!Object.hasOwn(MANAGEMENT_ACTION_AUTHORITY, action) || (action === "worktree.cleanup" && mode !== "apply")) return undefined;
+	const authority = MANAGEMENT_ACTION_AUTHORITY[action]!;
+	return { authority, decision: resolveAuthorityDecision({ action: authority, ...(policy ? { policy } : {}) }) };
 }
 
 export function validateAuthorityPolicy(value: unknown, label = "config.authorityPolicy"): AuthorityPolicyConfig | undefined {

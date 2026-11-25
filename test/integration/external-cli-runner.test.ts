@@ -38,6 +38,35 @@ function trackProcess<T>(child: ChildProcess, closed: Promise<T>): Promise<T> {
 	return closed;
 }
 
+async function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+	let timer: NodeJS.Timeout | undefined;
+	try {
+		return await Promise.race([promise.then(() => true, () => true), new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), timeoutMs); })]);
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
+}
+
+// A test that fails before releasing its runner must not leave it running into the next test's
+// ownership check, so cleanup waits for every runner and stops one that does not exit.
+function trackRunner<T>(child: ChildProcess, closed: Promise<T>): Promise<T> {
+	trackProcess(child, closed);
+	processDrains.push(async () => {
+		if (await settlesWithin(closed, RUNNER_TIMEOUT_MS)) return;
+		child.kill();
+		await settlesWithin(closed, 5_000);
+		throw new Error(`Runner ${child.pid ?? "unknown"} did not exit after its test released it`);
+	});
+	return closed;
+}
+
+/** Writes the files a test's external children wait on, at cleanup, if the test did not get to write them. */
+function releaseOnCleanup(...files: string[]): void {
+	processDrains.push(async () => {
+		for (const file of files) if (!fs.existsSync(file)) fs.writeFileSync(file, "");
+	});
+}
+
 function registerHelperDrain(release: () => void | Promise<void>, pidFile: string, exitedFile: string, closed: Promise<unknown>): void {
 	processDrains.push(async () => {
 		await release();
@@ -58,7 +87,10 @@ function registerHelperDrain(release: () => void | Promise<void>, pidFile: strin
 	});
 }
 
-async function waitForFile(file: string, timeoutMs = 5_000): Promise<void> {
+// A detached runner plus its external child can take well over 5 s to start on Windows CI.
+const RUNNER_TIMEOUT_MS = 30_000;
+
+async function waitForFile(file: string, timeoutMs = RUNNER_TIMEOUT_MS): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
 	while (!fs.existsSync(file)) {
 		if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${file}`);
@@ -106,8 +138,8 @@ async function waitForStatus(file: string, predicate: (status: AsyncStatus) => b
 
 function startRunner(configPath: string, cwd: string, env: NodeJS.ProcessEnv = process.env): Promise<number | null> {
 	const repo = path.resolve(import.meta.dirname, "../..");
-	const child = spawn(process.execPath, [path.join(repo, "node_modules/jiti/lib/jiti-cli.mjs"), path.join(repo, "src/runs/background/subagent-runner.ts"), configPath], { cwd, env, stdio: "inherit", shell: false });
-	return trackProcess(child, new Promise<number | null>((resolve, reject) => {
+	const child = spawn(process.execPath, [path.join(repo, "node_modules/jiti/lib/jiti-cli.mjs"), path.join(repo, "src/runs/background/subagent-runner-bootstrap.ts"), configPath], { cwd, env, stdio: "inherit", shell: false });
+	return trackRunner(child, new Promise<number | null>((resolve, reject) => {
 		child.once("error", reject);
 		child.once("close", resolve);
 	}));
@@ -115,10 +147,10 @@ function startRunner(configPath: string, cwd: string, env: NodeJS.ProcessEnv = p
 
 function startRunnerWithStderr(configPath: string, cwd: string, env: NodeJS.ProcessEnv = process.env): Promise<{ exitCode: number | null; stderr: string }> {
 	const repo = path.resolve(import.meta.dirname, "../..");
-	const child = spawn(process.execPath, [path.join(repo, "node_modules/jiti/lib/jiti-cli.mjs"), path.join(repo, "src/runs/background/subagent-runner.ts"), configPath], { cwd, env, stdio: ["ignore", "ignore", "pipe"] });
+	const child = spawn(process.execPath, [path.join(repo, "node_modules/jiti/lib/jiti-cli.mjs"), path.join(repo, "src/runs/background/subagent-runner-bootstrap.ts"), configPath], { cwd, env, stdio: ["ignore", "ignore", "pipe"] });
 	let stderr = "";
 	child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf-8"); });
-	return trackProcess(child, new Promise((resolve, reject) => {
+	return trackRunner(child, new Promise((resolve, reject) => {
 		child.once("error", reject);
 		child.once("close", (exitCode) => resolve({ exitCode, stderr }));
 	}));
@@ -131,7 +163,7 @@ function writeExternalConfig(dir: string, id: string, script: string, controlCon
 	fs.writeFileSync(configPath, JSON.stringify({
 		id,
 		sessionId: `session-${id}`,
-		steps: [{ agent: "external", task: "Activity test", runner: { type: "external-cli", command: process.execPath, args: ["-e", script] }, inheritProjectContext: false, inheritSkills: false }],
+		steps: [{ agent: "external", task: "Activity test", runner: { type: "external-cli", command: process.execPath, args: ["-e", script] }, inheritProjectContext: false, inheritGlobalContext: false, inheritSkills: false }],
 		resultPath: path.join(dir, "result.json"), cwd, placeholder: "{previous}", artifactConfig: { enabled: false }, asyncDir, resultMode: "single", controlConfig,
 	}));
 	return { asyncDir, configPath };
@@ -227,7 +259,7 @@ describe("external CLI async lifecycle", () => {
 			fs.writeFileSync(releaseGit, "");
 			await Promise.all(pids.map(waitForProcessExit));
 		});
-		await Promise.all([waitForFile(gitStarted, 30_000), waitForFile(wrapperPid, 30_000), waitForFile(descendantPid, 30_000)]);
+		await Promise.all([waitForFile(gitStarted), waitForFile(wrapperPid), waitForFile(descendantPid)]);
 		const stoppedAt = Date.now();
 		deliverStopRequest({ asyncDir, source: "test" });
 		let deadlineTimer: NodeJS.Timeout | undefined;
@@ -269,7 +301,7 @@ describe("external CLI async lifecycle", () => {
 			fs.writeFileSync(releaseGit, "");
 			await waitForProcessExit(pid);
 		});
-		await waitForFile(gitStarted, 30_000);
+		await waitForFile(gitStarted);
 		deliverStopRequest({ asyncDir, source: "test" });
 		const result = await runnerDone;
 		assert.equal(result.exitCode, 1);
@@ -295,7 +327,9 @@ describe("external CLI async lifecycle", () => {
 		const fakeBin = path.join(dir, "bin");
 		fs.mkdirSync(fakeBin);
 		fs.writeFileSync(path.join(fakeBin, "ps"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
-		const externalScript = `const fs=require('fs');fs.writeFileSync(${JSON.stringify(externalStarted)},'');setInterval(()=>{},1000)`;
+		const externalRelease = path.join(dir, "external-release");
+		const externalScript = `const fs=require('fs');fs.writeFileSync(${JSON.stringify(externalStarted)},'');setInterval(()=>{if(fs.existsSync(${JSON.stringify(externalRelease)}))process.exit(0)},20)`;
+		releaseOnCleanup(externalRelease);
 		const { asyncDir, configPath } = writeExternalConfig(dir, "external-periodic-unknown", externalScript, attentionControl, gitDir);
 		const runnerDone = startRunnerWithStderr(configPath, path.resolve(import.meta.dirname, "../.."), {
 			...process.env, PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ""}`,
@@ -307,7 +341,7 @@ describe("external CLI async lifecycle", () => {
 			fs.writeFileSync(releaseGit, "");
 			await waitForProcessExit(pid);
 		});
-		await Promise.all([waitForFile(externalStarted, 30_000), waitForFile(periodicStarted, 30_000)]);
+		await Promise.all([waitForFile(externalStarted), waitForFile(periodicStarted)]);
 		deliverStopRequest({ asyncDir, source: "test" });
 		const runner = await runnerDone;
 		assert.equal(runner.exitCode, 0, runner.stderr);
@@ -352,6 +386,7 @@ describe("external CLI async lifecycle", () => {
 		const appendedReady = path.join(dir, "appended-ready");
 		const finish = path.join(dir, "finish");
 		const firstScript = `const fs=require('fs');fs.writeFileSync(${JSON.stringify(firstReady)},'');const hold=setInterval(()=>{if(fs.existsSync(${JSON.stringify(releaseFirst)})){clearInterval(hold);process.exit(0)}},10)`;
+		releaseOnCleanup(releaseFirst, finish);
 		const { asyncDir, configPath } = writeExternalConfig(dir, "external-appended", firstScript, attentionControl);
 		const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
 		config.resultMode = "chain";
@@ -384,11 +419,13 @@ describe("external CLI async lifecycle", () => {
 		const calls = path.join(dir, "git-calls");
 		const ready = [path.join(dir, "ready-0"), path.join(dir, "ready-1")];
 		const finish = path.join(dir, "finish");
+		releaseOnCleanup(finish);
 		const tasks = ready.map((marker, index) => ({
 			agent: `external-${index}`,
 			task: "Stay silent",
 			runner: { type: "external-cli", command: process.execPath, args: ["-e", `const fs=require('fs');fs.writeFileSync(${JSON.stringify(marker)},'');const hold=setInterval(()=>{if(fs.existsSync(${JSON.stringify(finish)})){clearInterval(hold);process.exit(0)}},10)`] },
 			inheritProjectContext: false,
+			inheritGlobalContext: false,
 			inheritSkills: false,
 		}));
 		const asyncDir = path.join(dir, "async");
@@ -414,6 +451,7 @@ describe("external CLI async lifecycle", () => {
 			const go = path.join(dir, "emit");
 			const emitted = path.join(dir, "emitted");
 			const finish = path.join(dir, "finish");
+			releaseOnCleanup(go, finish);
 			const script = `const fs=require('fs');const go=${JSON.stringify(go)},emitted=${JSON.stringify(emitted)},finish=${JSON.stringify(finish)};const start=setInterval(()=>{if(!fs.existsSync(go))return;clearInterval(start);process.${stream}.write('activity');fs.writeFileSync(emitted,'');const hold=setInterval(()=>{if(fs.existsSync(finish)){clearInterval(hold);process.exit(0)}},10)},10)`;
 			const { asyncDir, configPath } = writeExternalConfig(dir, `external-${stream}-activity`, script, { ...attentionControl, needsAttentionAfterMs: 999_999 });
 			const runnerDone = startRunner(configPath, path.resolve(import.meta.dirname, "../.."));
@@ -435,6 +473,7 @@ describe("external CLI async lifecycle", () => {
 			const go = path.join(dir, "mutate");
 			const mutated = path.join(dir, "mutated");
 			const finish = path.join(dir, "finish");
+			releaseOnCleanup(go, finish);
 			const mutationCode = mutation === "commit"
 				? `fs.writeFileSync('tracked.txt','committed\\n');require('child_process').execFileSync('git',['add','tracked.txt']);require('child_process').execFileSync('git',['commit','-qm','child'])`
 				: `fs.writeFileSync('tracked.txt','changed\\n')`;
@@ -459,6 +498,7 @@ describe("external CLI async lifecycle", () => {
 		const gitDir = await createGitRepo(dir, true);
 		const startedMarker = path.join(dir, "started");
 		const finish = path.join(dir, "finish");
+		releaseOnCleanup(finish);
 		const script = `const fs=require('fs');const finish=${JSON.stringify(finish)};fs.writeFileSync(${JSON.stringify(startedMarker)},'');const hold=setInterval(()=>{if(fs.existsSync(finish)){clearInterval(hold);process.exit(0)}},10)`;
 		const { asyncDir, configPath } = writeExternalConfig(dir, "external-git-unchanged", script, attentionControl, gitDir);
 		const runnerDone = startRunner(configPath, path.resolve(import.meta.dirname, "../.."));
@@ -486,6 +526,7 @@ describe("external CLI async lifecycle", () => {
 				systemPrompt: "System text",
 				systemPromptMode: "replace",
 				inheritProjectContext: false,
+				inheritGlobalContext: false,
 				inheritSkills: false,
 			}],
 			resultPath,
@@ -496,7 +537,7 @@ describe("external CLI async lifecycle", () => {
 			resultMode: "single",
 		}));
 		const repo = path.resolve(import.meta.dirname, "../..");
-		const exitCode = await runProcess(process.execPath, [path.join(repo, "node_modules/jiti/lib/jiti-cli.mjs"), path.join(repo, "src/runs/background/subagent-runner.ts"), configPath], repo);
+		const exitCode = await runProcess(process.execPath, [path.join(repo, "node_modules/jiti/lib/jiti-cli.mjs"), path.join(repo, "src/runs/background/subagent-runner-bootstrap.ts"), configPath], repo);
 		assert.equal(exitCode, 0);
 		const status = JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8"));
 		assert.equal(status.state, "complete");
@@ -527,6 +568,7 @@ describe("external CLI async lifecycle", () => {
 				task: "Task text",
 				runner: { type: "external-cli", command: process.execPath, args: ["-e", "process.stdout.write('ok')"] },
 				inheritProjectContext: false,
+				inheritGlobalContext: false,
 				inheritSkills: false,
 			}],
 			resultPath,
@@ -537,7 +579,7 @@ describe("external CLI async lifecycle", () => {
 			resultMode: "single",
 		}));
 		const repo = path.resolve(import.meta.dirname, "../..");
-		const exitCode = await runProcess(process.execPath, [path.join(repo, "node_modules/jiti/lib/jiti-cli.mjs"), path.join(repo, "src/runs/background/subagent-runner.ts"), configPath], repo);
+		const exitCode = await runProcess(process.execPath, [path.join(repo, "node_modules/jiti/lib/jiti-cli.mjs"), path.join(repo, "src/runs/background/subagent-runner-bootstrap.ts"), configPath], repo);
 		assert.equal(exitCode, 0);
 		const status = JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8"));
 		assert.equal(status.state, "complete");
@@ -571,6 +613,7 @@ describe("external CLI async lifecycle", () => {
 				systemPrompt: "System text",
 				systemPromptMode: "replace",
 				inheritProjectContext: false,
+				inheritGlobalContext: false,
 				inheritSkills: false,
 			}],
 			resultPath,
@@ -583,7 +626,7 @@ describe("external CLI async lifecycle", () => {
 		const repo = path.resolve(import.meta.dirname, "../..");
 		const exitCode = await runProcess(
 			process.execPath,
-			[path.join(repo, "node_modules/jiti/lib/jiti-cli.mjs"), path.join(repo, "src/runs/background/subagent-runner.ts"), configPath],
+			[path.join(repo, "node_modules/jiti/lib/jiti-cli.mjs"), path.join(repo, "src/runs/background/subagent-runner-bootstrap.ts"), configPath],
 			repo,
 			{ ...process.env, PI_CODING_AGENT_DIR: agentDir, PI_SUBAGENT_ORCA_BINARY: fakeOrca, ORCA_TEST_CAPTURE: capture },
 		);

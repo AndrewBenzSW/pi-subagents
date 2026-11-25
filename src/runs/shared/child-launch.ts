@@ -14,16 +14,16 @@ import {
 	type LaunchResolvedChildExtensions,
 	type ResolvedToolBudget,
 	type RunFanoutBudgetDescriptor,
-	type HerdrMachineReference,
+	type PlacementMachineReference,
 } from "../../shared/types.ts";
 import type { NestedPathEntry } from "./nested-path.ts";
-import type { McpRuntimeSnapshotHost } from "./mcp-direct-tool-allowlist.ts";
+import { extensionOnlyMcpServers, type McpRuntimeSnapshotHost, type ResolvedMcpDirectToolSelection } from "./mcp-direct-tool-allowlist.ts";
 import type { PermissionRules } from "./permissions.ts";
 import type { StructuredOutputRuntime } from "./structured-output.ts";
 import type { ChildToolDiagnostic } from "./tool-availability.ts";
 import type { RuntimeAcknowledgedChildExtensions } from "../../shared/types.ts";
 import { encodeExtensionBindings, PI_SUBAGENT_EXTENSION_BINDINGS_ENV, type ExtensionBindings } from "./extension-bindings.ts";
-import type { ResolvedSubagentCapabilityCeiling, SubagentCapabilityAudit } from "./capability-ceiling.ts";
+import { intersectSubagentCapabilityCeilings, type ResolvedSubagentCapabilityCeiling, type SubagentCapabilityAudit } from "./capability-ceiling.ts";
 import {
 	isSubagentRuntimeExtensionPath,
 	projectLaunchResolvedChildExtensions,
@@ -35,8 +35,7 @@ import type { ChildRuntimeConfig } from "./child-runtime-config.ts";
 import { createCapturedChildHooks, withChildSessionErrorReporting } from "./child-hooks.ts";
 import type { ChildTranscriptWriter } from "../../shared/child-transcript.ts";
 import type { ChildSessionLaunch, ChildSessionStorage } from "./child-session.ts";
-import type { ArbiterModelContext } from "./llm-intent-arbiter.ts";
-import { resolveRequiredChildExtensions, type RequiredChildExtensionSnapshot } from "../../shared/required-child-extensions.ts";
+import { createRequiredChildExtensionIdentity, resolveRequiredChildExtensions, type RequiredChildExtensionSnapshot } from "../../shared/required-child-extensions.ts";
 
 /** Environment variable pi-mcp-adapter reads for the tools a child may expose. */
 export const MCP_DIRECT_TOOLS_ENV = "MCP_DIRECT_TOOLS";
@@ -63,10 +62,14 @@ export function inheritedChildRuntime(config: ChildRuntimeConfig | undefined): I
 }
 
 export interface BuildInProcessChildLaunchInput {
-	machine?: HerdrMachineReference;
+	machine?: PlacementMachineReference;
 	remoteSkillNames?: string[];
 	remoteReads?: string[] | false;
+	/** Acceptance instructions already folded into `systemPrompt`; a placed child gets only these, since it builds the rest from its own agent file. */
+	acceptancePrompt?: string;
 	parentSessionId?: string;
+	/** The launching session's file; a new child session records it as its parent. */
+	parentSessionFile?: string;
 	forkCacheKey?: string;
 	sessionEnabled: boolean;
 	sessionDir?: string;
@@ -86,9 +89,13 @@ export interface BuildInProcessChildLaunchInput {
 	requiredExtensions?: RequiredChildExtensionSnapshot;
 	systemPrompt?: string | null;
 	mcpDirectTools?: string[];
+	/** Selections the parent resolved against Pi's built-in MCP, carried to the runner. */
+	builtinMcpTools?: ResolvedMcpDirectToolSelection[];
 	extensionBindings?: ExtensionBindings;
 	cwd: string;
 	intercomSessionName?: string;
+	/** The launching session's project trust; undefined when the host has no trust concept. */
+	projectTrusted?: boolean;
 	sessionName?: string;
 	orchestratorIntercomTarget?: string;
 	runId?: string;
@@ -98,15 +105,13 @@ export interface BuildInProcessChildLaunchInput {
 	runFanoutBudget?: RunFanoutBudgetDescriptor;
 	structuredOutput?: StructuredOutputRuntime;
 	fast?: boolean;
-	modelCandidates?: readonly string[];
 	toolBudget?: ResolvedToolBudget;
 	permissionRules?: PermissionRules;
 	permissionAuditPath?: string;
 	childWatchdog?: ChildWatchdogConfig;
 	watchdogStatus?: (event: ChildWatchdogStatusEvent) => void;
-	waitToolEnabled?: boolean;
-	waitToolDefaultTimeoutMs?: number;
 	allowNestedSubagents?: boolean;
+	descendantAllowedAgents?: string[];
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
 	thinkingCeiling?: ThinkingLevel;
 	maxSubagentDepth?: number;
@@ -120,17 +125,9 @@ export interface BuildInProcessChildLaunchInput {
 	 * them and exposes the child environment external extensions read.
 	 */
 	host: "parent" | "runner";
-	/**
-	 * Pi core tool names the host runtime provides. When set, child tool plans
-	 * intersect known core slots with this set; declared non-core names remain
-	 * for child startup validation. Review/scout lanes fail closed when a requested,
-	 * still-permitted repository inspection tool is missing from that set.
-	 */
-	hostAvailableBuiltins?: readonly string[];
 }
 
 export interface InProcessChildCapture {
-	completionIntentContext?(): ArbiterModelContext | undefined;
 	structuredOutput(): { called: boolean; value?: unknown; acceptanceReport?: unknown; acceptanceReportProvided: boolean };
 	toolDiagnostic(): ChildToolDiagnostic | undefined;
 	runtimeAcknowledgedExtensions(): RuntimeAcknowledgedChildExtensions | undefined;
@@ -152,7 +149,6 @@ export function createReportedChildSessionInput(launch: InProcessChildLaunch, tr
 	return withChildSessionErrorReporting(launch.session, transcriptWriter);
 }
 
-/** Escape XML-significant characters in a string for safe attribute interpolation. */
 function escapeXmlAttr(value: string): string {
 	return value
 		.replace(/&/g, "&amp;")
@@ -165,14 +161,17 @@ function inheritedCapabilityCeiling(inherited: InheritedChildRuntime | undefined
 	return inherited?.capabilityCeiling;
 }
 
-/** Environment values external child extensions read; only the runner applies them. */
+/** Environment values external child extensions read in the runner, which hosts only children. */
 function childProcessEnv(input: BuildInProcessChildLaunchInput, toolPlan: PiLaunchToolPlan): Record<string, string | undefined> {
 	const env: Record<string, string | undefined> = {};
 	env[PI_SUBAGENT_EXTENSION_BINDINGS_ENV] = encodeExtensionBindings(input.extensionBindings);
-	if (!toolPlan.capabilityCeiling && input.mcpDirectTools?.length) env[MCP_DIRECT_TOOLS_ENV] = input.mcpDirectTools.join(",");
+	// Selectors resolved against Pi's built-in MCP never reach an adapter.
+	if (toolPlan.builtinMcpTools) env[MCP_DIRECT_TOOLS_ENV] = "__none__";
+	else if (!toolPlan.capabilityCeiling && input.mcpDirectTools?.length) env[MCP_DIRECT_TOOLS_ENV] = input.mcpDirectTools.join(",");
 	else if (toolPlan.capabilityCeiling && toolPlan.effectiveMcpSelections.length && !toolPlan.capabilityCeiling.denyExtensions) {
 		env[MCP_DIRECT_TOOLS_ENV] = toolPlan.effectiveMcpSelections.map((selection) => selection.selector).join(",");
-	} else env[MCP_DIRECT_TOOLS_ENV] = "__none__";
+	} else if (input.tools === undefined && !toolPlan.capabilityCeiling) env[MCP_DIRECT_TOOLS_ENV] = undefined;
+	else env[MCP_DIRECT_TOOLS_ENV] = "__none__";
 	return env;
 }
 
@@ -190,7 +189,17 @@ function childStorage(input: BuildInProcessChildLaunchInput): ChildSessionStorag
 }
 
 export function buildInProcessChildLaunch(input: BuildInProcessChildLaunchInput): InProcessChildLaunch {
-	const requiredExtensions = input.requiredExtensions ?? input.inherited?.requiredExtensions ?? resolveRequiredChildExtensions(input.parentSessionId);
+	const resolvedRequiredExtensions = input.requiredExtensions ?? input.inherited?.requiredExtensions ?? resolveRequiredChildExtensions(input.parentSessionId);
+	// A placed child cannot load local extension paths, so it skips non-mandatory entries like an
+	// external runner does; a mandatory one stays and refuses the launch when it is serialized.
+	const requiredExtensions = input.machine ? resolvedRequiredExtensions.filter((entry) => entry.requireForAllRunners) : resolvedRequiredExtensions;
+	const agentCapabilityCeiling: ResolvedSubagentCapabilityCeiling | undefined = input.descendantAllowedAgents === undefined
+		? undefined
+		: { version: 1, allowedAgents: [...input.descendantAllowedAgents], denyExtensions: false, sources: [`agent:${input.childAgentName}`] };
+	const inheritedCeiling = inheritedCapabilityCeiling(input.inherited);
+	const capabilityCeilingForPlanning = agentCapabilityCeiling && !input.capabilityCeiling && !inheritedCeiling
+		? { version: 1 as const, denyExtensions: false, sources: [] }
+		: input.capabilityCeiling;
 	const toolPlan = resolvePiLaunchToolPlan({
 		tools: input.tools,
 		excludeTools: input.excludeTools,
@@ -199,19 +208,29 @@ export function buildInProcessChildLaunch(input: BuildInProcessChildLaunchInput)
 		subagentOnlyExtensions: input.subagentOnlyExtensions,
 		requiredExtensions,
 		mcpDirectTools: input.mcpDirectTools,
+		builtinMcpTools: input.builtinMcpTools,
 		cwd: input.cwd,
 		requireReadTool: input.requireReadTool,
 		structuredOutput: Boolean(input.structuredOutput),
 		fast: input.fast,
 		model: input.model,
-		modelCandidates: input.modelCandidates,
-		capabilityCeiling: input.capabilityCeiling,
-		inheritedCapabilityCeiling: inheritedCapabilityCeiling(input.inherited),
+		capabilityCeiling: capabilityCeilingForPlanning,
+		inheritedCapabilityCeiling: inheritedCeiling,
 		agentName: input.childAgentName,
 		permissionRules: input.permissionRules,
 		runtimeSnapshotHost: input.runtimeSnapshotHost,
-		hostAvailableBuiltins: input.hostAvailableBuiltins,
 	});
+	// Foreground children load no ambient extensions, so only their required extensions' registerMcpServer() runs in them.
+	if (input.host === "parent" && input.runtimeSnapshotHost && toolPlan.builtinMcpTools?.length) {
+		const requiredExtensionIdentity = createRequiredChildExtensionIdentity(toolPlan.requiredExtensions.map(({ path }) => path));
+		// Pi treats a session without a trust decision as trusted.
+		const servers = extensionOnlyMcpServers(toolPlan.effectiveMcpSelections, input.runtimeSnapshotHost, input.cwd, input.projectTrusted !== false, (extensionPath) => requiredExtensionIdentity(extensionPath) !== undefined);
+		if (servers.length) throw new Error(`Agent '${input.childAgentName}' selects MCP tools from servers that extensions registered (${servers.join(", ")}). Only background children (async: true) load those extensions; run the agent in the background or add the server to the global mcp.json or a trusted project's .pi/mcp.json.`);
+	}
+	toolPlan.capabilityCeiling = intersectSubagentCapabilityCeilings(toolPlan.capabilityCeiling, agentCapabilityCeiling);
+	if (toolPlan.capabilityAudit && toolPlan.capabilityCeiling) {
+		toolPlan.capabilityAudit = { ...toolPlan.capabilityAudit, ceiling: toolPlan.capabilityCeiling };
+	}
 
 	const inherited = input.inherited;
 	const fanout = toolPlan.fanoutAuthorized;
@@ -240,8 +259,10 @@ export function buildInProcessChildLaunch(input: BuildInProcessChildLaunchInput)
 	let structuredAcceptanceReport: unknown;
 	let structuredCalled = false;
 	let structuredAcceptanceProvided = false;
+	const structuredTerminalState = { captured: false };
 
 	const config: ChildRuntimeConfig = {
+		cwd: input.cwd,
 		...(input.runId ? { runId: input.runId } : {}),
 		agent: input.childAgentName,
 		childIndex: input.childIndex,
@@ -267,14 +288,11 @@ export function buildInProcessChildLaunch(input: BuildInProcessChildLaunchInput)
 		...(input.toolBudget ? { toolBudget: input.toolBudget } : {}),
 		...(input.childWatchdog ? { childWatchdog: input.childWatchdog } : {}),
 		...(input.watchdogStatus ? { watchdogStatus: input.watchdogStatus } : {}),
-		waitTool: {
-			enabled: input.waitToolEnabled ?? true,
-			...(input.waitToolDefaultTimeoutMs !== undefined ? { defaultTimeoutMs: input.waitToolDefaultTimeoutMs } : {}),
-		},
 		...(input.structuredOutput
 			? {
 				structuredOutput: {
 					schema: input.structuredOutput.schema,
+					terminalState: structuredTerminalState,
 					...(input.structuredOutput.acceptanceReportPath
 						? { acceptanceReport: input.structuredOutput.acceptanceReportRequired ? "required" as const : "optional" as const }
 						: {}),
@@ -283,6 +301,7 @@ export function buildInProcessChildLaunch(input: BuildInProcessChildLaunchInput)
 						structuredValue = value;
 						structuredAcceptanceProvided = acceptanceReport !== undefined;
 						structuredAcceptanceReport = acceptanceReport;
+						structuredTerminalState.captured = true;
 					},
 				},
 			}
@@ -291,7 +310,7 @@ export function buildInProcessChildLaunch(input: BuildInProcessChildLaunchInput)
 		...(toolPlan.effectiveMcpTools.length > 0 ? { mcpDirectTools: toolPlan.effectiveMcpTools } : {}),
 		fast: input.fast === true,
 	};
-	const capturedHooks = createCapturedChildHooks(config, input.host === "runner");
+	const capturedHooks = createCapturedChildHooks(config);
 
 	const extensionPaths = toolPlan.extensionArgs.filter((extensionPath) => !isSubagentRuntimeExtensionPath(extensionPath));
 	const ambientExtensions = input.host === "runner" && !toolPlan.disableAmbientExtensions;
@@ -308,16 +327,22 @@ export function buildInProcessChildLaunch(input: BuildInProcessChildLaunchInput)
 	const session: Omit<ChildSessionLaunch, "onExtensionError"> = {
 		cwd: input.cwd,
 		...(input.machine ? { machine: input.machine } : {}),
-		...(input.machine ? { remoteResources: { agent: input.childAgentName, ...(input.remoteSkillNames ? { skills: input.remoteSkillNames } : {}), ...(input.remoteReads !== undefined ? { reads: input.remoteReads } : {}), ...(toolPlan.explicitToolAllowlist ? { toolCeiling: [...toolPlan.effectiveToolAllowlist] } : toolPlan.capabilityCeiling?.allowedTools ? { toolCeiling: [...toolPlan.capabilityCeiling.allowedTools] } : {}) } } : {}),
+		...(input.projectTrusted !== undefined ? { projectTrusted: input.projectTrusted } : {}),
+		...(input.machine ? { remoteResources: { agent: input.childAgentName, ...(input.remoteSkillNames ? { skills: input.remoteSkillNames } : {}), ...(input.remoteReads !== undefined ? { reads: input.remoteReads } : {}), ...(toolPlan.explicitToolAllowlist ? { toolCeiling: [...toolPlan.effectiveToolAllowlist] } : toolPlan.capabilityCeiling?.allowedTools ? { toolCeiling: [...toolPlan.capabilityCeiling.allowedTools] } : {}), ...(input.acceptancePrompt ? { acceptancePrompt: input.acceptancePrompt } : {}) } } : {}),
 		storage: childStorage(input),
+		...(input.parentSessionFile ? { parentSessionFile: input.parentSessionFile } : {}),
 		...(input.model ? { model: input.model } : {}),
 		...(toolPlan.explicitToolAllowlist ? { tools: toolPlan.effectiveToolAllowlist } : {}),
+		...(toolPlan.builtinMcpTools?.length ? { builtinMcpTools: toolPlan.builtinMcpTools } : {}),
 		...(!toolPlan.explicitToolAllowlist && toolPlan.excludeTools.length > 0 ? { excludeTools: toolPlan.excludeTools } : {}),
 		extensionPaths,
 		requiredExtensions: toolPlan.requiredExtensions,
 		ambientExtensions,
 		hooks: capturedHooks.hooks,
-		...(input.host === "runner" ? { processEnv: childProcessEnv(input, toolPlan) } : {}),
+		// A foreground child gets only its own bindings, so it never sees those of the session that launched it.
+		...(input.host === "runner"
+			? { processEnv: childProcessEnv(input, toolPlan) }
+			: { processEnv: { [PI_SUBAGENT_EXTENSION_BINDINGS_ENV]: encodeExtensionBindings(input.extensionBindings) }, restoreProcessEnv: true }),
 		runtime: config,
 		noSkills: !input.inheritSkills,
 		noContextFiles: !input.inheritProjectContext,
@@ -331,7 +356,6 @@ export function buildInProcessChildLaunch(input: BuildInProcessChildLaunchInput)
 		config,
 		session,
 		capture: {
-			completionIntentContext: capturedHooks.completionIntentContext,
 			structuredOutput: () => ({ called: structuredCalled, value: structuredValue, acceptanceReport: structuredAcceptanceReport, acceptanceReportProvided: structuredAcceptanceProvided }),
 			toolDiagnostic: capturedHooks.toolDiagnostic,
 			runtimeAcknowledgedExtensions: capturedHooks.runtimeAcknowledgedExtensions,

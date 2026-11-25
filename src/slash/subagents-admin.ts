@@ -15,8 +15,9 @@ import { mergeRuntimeAgents, type RuntimeAgentOwner } from "../agents/runtime-ag
 import { editableAgentConfig, preservedAgentFrontmatterFields } from "../agents/agent-management.ts";
 import { findModelInfo, getSupportedThinkingLevels, toModelInfo } from "../shared/model-info.ts";
 import { SelectorComponent, type SelectorItem, type SelectorResult } from "./selector.ts";
+import { canRenderComponents } from "../shared/extension-context.ts";
 
-const ADMIN_MESSAGE_TYPE = "subagents-admin";
+export const ADMIN_MESSAGE_TYPE = "subagents-admin";
 const INHERIT_MODEL_CHOICE = "Default / inherit session model";
 const INHERIT_THINKING_CHOICE = "Default / inherit session thinking";
 
@@ -29,12 +30,12 @@ function sourceRank(source: AgentConfig["source"]): number {
 	return 3;
 }
 
-function allVisibleAgents(pi: RuntimeAgentOwner, cwd: string): AgentConfig[] {
-	const d = discoverAgentsAll(cwd);
+function allVisibleAgents(pi: RuntimeAgentOwner, cwd: string, preferredModelProvider?: string): AgentConfig[] {
+	const d = discoverAgentsAll(cwd, preferredModelProvider);
 	const allConfigured = [...d.project, ...d.user, ...d.package, ...d.builtin];
 	const visibleConfigured = allConfigured.filter((agent) => !agent.disabled);
 	// Disabled definitions remain in collision checks even though the panel hides them.
-	const agents = mergeRuntimeAgents(pi, { agents: visibleConfigured }, allConfigured).agents;
+	const agents = mergeRuntimeAgents(pi, { agents: visibleConfigured }, allConfigured, { cwd, scope: "both", preferredModelProvider }).agents;
 	return agents.sort((a, b) => a.name.localeCompare(b.name) || sourceRank(a.source) - sourceRank(b.source));
 }
 
@@ -94,7 +95,6 @@ async function liveAvailableModels(ctx: ExtensionContext) {
 function buildBuiltinBase(agent: AgentConfig): BuiltinAgentOverrideBase {
 	return {
 		...(agent.model !== undefined ? { model: agent.model } : {}),
-		...(agent.fallbackModels !== undefined ? { fallbackModels: [...agent.fallbackModels] } : {}),
 		...(agent.thinking !== undefined ? { thinking: agent.thinking } : {}),
 		systemPromptMode: agent.systemPromptMode,
 		inheritProjectContext: agent.inheritProjectContext,
@@ -110,7 +110,6 @@ function buildBuiltinBase(agent: AgentConfig): BuiltinAgentOverrideBase {
 		...(agent.mcpDirectTools !== undefined ? { mcpDirectTools: [...agent.mcpDirectTools] } : {}),
 		...(agent.subagentOnlyExtensions !== undefined ? { subagentOnlyExtensions: [...agent.subagentOnlyExtensions] } : {}),
 		...(agent.mutationTools !== undefined ? { mutationTools: [...agent.mutationTools] } : {}),
-		...(agent.completionGuard !== undefined ? { completionGuard: agent.completionGuard } : {}),
 		...(agent.toolBudget !== undefined ? { toolBudget: agent.toolBudget } : {}),
 	};
 }
@@ -161,7 +160,7 @@ function readOnlyAgentMessage(agent: AgentConfig, field: EditableOverrideField):
 }
 
 async function selectAgent(pi: RuntimeAgentOwner, ctx: ExtensionContext, args: string): Promise<AgentSelection> {
-	const agents = allVisibleAgents(pi, ctx.cwd);
+	const agents = allVisibleAgents(pi, ctx.cwd, ctx.model?.provider);
 	const requestedName = args.trim().split(/\s+/)[0] ?? "";
 	if (agents.length === 0) return { kind: "not-found", agents, requestedName: requestedName || undefined };
 
@@ -195,7 +194,6 @@ function metadataFor(agent: AgentConfig): string {
 		lines.push(`Package: ${agent.packageName}`);
 	}
 	lines.push(`Model: ${agent.model ?? "default / inherit"}`);
-	if (agent.fallbackModels?.length) lines.push(`Fallback models: ${agent.fallbackModels.join(", ")}`);
 	if (agent.thinking !== undefined) lines.push(`Thinking: ${agent.thinking === false ? "off" : agent.thinking}`);
 	if (tools.length) lines.push(`Tools: ${tools.join(", ")}`);
 	if (agent.excludeTools?.length) lines.push(`Excluded tools: ${agent.excludeTools.join(", ")}`);
@@ -216,7 +214,8 @@ function metadataFor(agent: AgentConfig): string {
 }
 
 async function selectFromList(ctx: ExtensionContext, title: string, subtitle: string | undefined, items: SelectorItem[]): Promise<string | undefined> {
-	if (typeof ctx.ui.custom === "function") {
+	// Hosts that expose only the RPC no-op stub cannot show the component; they use `ui.select` below.
+	if (canRenderComponents(ctx)) {
 		const result = await ctx.ui.custom<SelectorResult>(
 			(tui, theme, kb, done) => new SelectorComponent(tui, theme, kb, { title, subtitle, items, done }),
 			{ overlay: false },
@@ -451,7 +450,6 @@ export async function openSubagentsAdmin(pi: ExtensionAPI, ctx: ExtensionContext
 			ctx.ui.notify(message, "info");
 			sendAdminMessage(pi, message);
 		} else if (action === "Show details") {
-			// Full metadata is now opt-in (previously always posted to the thread).
 			sendAdminMessage(pi, metadataFor(agent));
 		}
 	} catch (error) {

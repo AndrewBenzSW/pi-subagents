@@ -29,8 +29,6 @@ export interface SubagentCapabilityAudit {
 	effectiveMcpTools: string[];
 	agentAllowed: boolean;
 	agentRestrictionSources?: string[];
-	/** Builtin tools declared but unavailable on the host runtime. */
-	unavailableHostBuiltins?: string[];
 }
 
 export interface RegisterSubagentCapabilityCeilingOptions {
@@ -62,6 +60,10 @@ function validateText(value: unknown, field: string): string {
 		throw new Error(`Invalid capability ceiling ${field}; expected a non-empty string without control characters (max 256 UTF-8 bytes).`);
 	}
 	return value.trim();
+}
+
+export function normalizeCapabilityCeilingAllowedAgents(values: unknown): string[] {
+	return normalizeCeiling({ allowedAgents: values } as SubagentCapabilityCeiling).allowedAgents!;
 }
 
 function normalizeCeiling(ceiling: SubagentCapabilityCeiling): ResolvedSubagentCapabilityCeiling {
@@ -167,8 +169,9 @@ export function resolveSubagentCapabilityCeiling(sessionId: string | undefined, 
 	return intersectSubagentCapabilityCeilings(inherited, ...active);
 }
 
-export function resolveCurrentSubagentCapabilityCeiling(sessionId: string | undefined): ResolvedSubagentCapabilityCeiling | undefined {
-	return resolveSubagentCapabilityCeiling(sessionId, undefined);
+/** Ceilings are registered under `ctx.sessionManager.getSessionId()`; pass that id, never the session file path. */
+export function resolveCurrentSubagentCapabilityCeiling(piSessionId: string | undefined): ResolvedSubagentCapabilityCeiling | undefined {
+	return resolveSubagentCapabilityCeiling(piSessionId, undefined);
 }
 
 export function isAgentAllowedByCapabilityCeiling(agentName: string, ceiling: ResolvedSubagentCapabilityCeiling | undefined): boolean {

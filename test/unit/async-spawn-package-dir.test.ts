@@ -5,7 +5,7 @@ import { syncBuiltinESMExports } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
-import { resolveInstalledPiPackageRoot, resolvePiPackageRoot } from "../../src/runs/shared/pi-spawn.ts";
+import { resolveHostPiPackageRoot, resolveInstalledPiPackageRoot, resolvePiPackageRoot } from "../../src/runs/shared/pi-spawn.ts";
 import { PI_CODING_AGENT_PACKAGE_ROOT_ENV } from "../../src/shared/utils.ts";
 import { makeAgent } from "../support/helpers.ts";
 
@@ -37,7 +37,7 @@ test("detached spawn does not keep an inherited bundled-layout PI_PACKAGE_DIR", 
 			acceptance: false,
 		});
 		assert.match(result.content[0]!.text, /spawn boundary captured/);
-		const npmRoot = resolvePiPackageRoot() ?? resolveInstalledPiPackageRoot();
+		const npmRoot = resolveHostPiPackageRoot();
 		assert.equal(spawn.mock.calls[0]!.arguments[2].env.PI_PACKAGE_DIR, npmRoot);
 		assert.notEqual(npmRoot, bundled);
 	} finally {
@@ -87,6 +87,9 @@ test("detached launch honors the package-root environment override when host det
 
 test("detached launch ignores a whitespace-only package-root override", async (t) => {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "blank-package-root-"));
+	const previousArgv = process.argv[1];
+	// No real host entry: this fixture withholds both host-relative and installed discovery.
+	process.argv[1] = path.join(root, "missing-host.mjs");
 	const previous = process.env[PI_CODING_AGENT_PACKAGE_ROOT_ENV];
 	process.env[PI_CODING_AGENT_PACKAGE_ROOT_ENV] = "   ";
 	const manifests = [resolvePiPackageRoot(), resolveInstalledPiPackageRoot()]
@@ -109,6 +112,7 @@ test("detached launch ignores a whitespace-only package-root override", async (t
 		assert.match(result.content[0]!.text, /installed npm package.*neither is available/);
 		assert.equal(spawn.mock.calls.length, 0);
 	} finally {
+		process.argv[1] = previousArgv;
 		t.mock.restoreAll();
 		syncBuiltinESMExports();
 		if (previous === undefined) delete process.env[PI_CODING_AGENT_PACKAGE_ROOT_ENV];
@@ -119,6 +123,8 @@ test("detached launch ignores a whitespace-only package-root override", async (t
 
 test("npm detached launch fails closed when the detected package root is absent", async (t) => {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "missing-npm-root-"));
+	const previousArgv = process.argv[1];
+	process.argv[1] = path.join(root, "missing-host.mjs");
 	const previous = process.env[PI_CODING_AGENT_PACKAGE_ROOT_ENV];
 	// An ambient override would satisfy host detection and defeat the fixture.
 	delete process.env[PI_CODING_AGENT_PACKAGE_ROOT_ENV];
@@ -142,10 +148,63 @@ test("npm detached launch fails closed when the detected package root is absent"
 		assert.match(result.content[0]!.text, /installed npm package.*neither is available/);
 		assert.equal(spawn.mock.callCount(), 0);
 	} finally {
+		process.argv[1] = previousArgv;
 		t.mock.restoreAll();
 		syncBuiltinESMExports();
 		if (previous === undefined) delete process.env[PI_CODING_AGENT_PACKAGE_ROOT_ENV];
 		else process.env[PI_CODING_AGENT_PACKAGE_ROOT_ENV] = previous;
 		fs.rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("detached spawn drops inherited Git repository routing variables and keeps other environment", async (t) => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "git-env-spawn-"));
+	const inherited = {
+		GIT_DIR: "/outer/repo/.git",
+		GIT_WORK_TREE: "/outer/repo",
+		GIT_INDEX_FILE: "/outer/repo/.git/index",
+		GIT_COMMON_DIR: "/outer/repo/.git",
+		GIT_CONFIG_COUNT: "1",
+		GIT_CONFIG_KEY_0: "core.hooksPath",
+		GIT_CONFIG_VALUE_0: "/outer/hooks",
+		GIT_CONFIG_PARAMETERS: "'core.bare'='true'",
+		GIT_AUTHOR_NAME: "Kept Author",
+		GIT_ENV_SENTINEL_KEEP: "kept",
+	};
+	const previous = Object.fromEntries(Object.keys(inherited).map((key) => [key, process.env[key]]));
+	Object.assign(process.env, inherited);
+	const spawn = t.mock.method(childProcess, "spawn", () => {
+		throw new Error("spawn boundary captured");
+	});
+	syncBuiltinESMExports();
+	try {
+		const { executeAsyncSingle: launch } = await import("../../src/runs/background/async-execution.ts");
+		const result = launch("spawn-git-env", {
+			agent: "worker",
+			task: "Inspect git env",
+			agentConfig: makeAgent("worker"),
+			ctx: { pi: { events: { emit() {} } }, cwd, currentSessionId: "spawn-git-env" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			sessionRoot: path.join(cwd, "sessions"),
+			maxSubagentDepth: 1,
+			acceptance: false,
+		});
+		assert.match(result.content[0]!.text, /spawn boundary captured/);
+		const env = spawn.mock.calls[0]!.arguments[2].env;
+		for (const key of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "GIT_CONFIG_PARAMETERS"]) {
+			assert.equal(env[key], undefined, key);
+		}
+		assert.equal(env.GIT_AUTHOR_NAME, "Kept Author");
+		assert.equal(env.GIT_ENV_SENTINEL_KEEP, "kept");
+		assert.ok(env.PI_PACKAGE_DIR, "launch-owned variables are still set");
+	} finally {
+		t.mock.restoreAll();
+		syncBuiltinESMExports();
+		for (const [key, value] of Object.entries(previous)) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+		fs.rmSync(cwd, { recursive: true, force: true });
 	}
 });

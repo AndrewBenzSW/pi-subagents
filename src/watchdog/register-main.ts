@@ -1,10 +1,8 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
 import { resolveEffectiveThinking, splitKnownThinkingSuffix, THINKING_LEVELS, type ThinkingLevel } from "../shared/model-info.ts";
-import { SLASH_TEXT_RESULT_TYPE } from "../shared/types.ts";
-import { captureWatchdogDiffBaseline, type WatchdogDiffBaseline } from "./diff-tool.ts";
+import { SLASH_TEXT_RESULT_TYPE, SLASH_TEXT_VIEW_ONLY_DETAILS } from "../shared/types.ts";
+import { startWatchdogDiffBaselineCapture, type WatchdogDiffBaseline } from "./diff-tool.ts";
 import { formatWatchdogRecommendation, recommendWatchdogModel, resolveWatchdogModelInput, parseWatchdogThinkingInput } from "./model-selection.ts";
-import { renderWatchdogWarning } from "./render.ts";
 import { createMainWatchdogReview } from "./review.ts";
 import { MainWatchdogRuntime, type WatchdogReviewFunction } from "./runtime.ts";
 import { getWatchdogUserSettingsPath, writeUserWatchdogEnabled, writeWatchdogModelSettings } from "./settings.ts";
@@ -12,17 +10,18 @@ import {
 	SUBAGENT_WATCHDOG_WARNING_TYPE,
 	type WatchdogRuntimeStatus,
 	type WatchdogWarning,
-	type WatchdogWarningDetails,
 } from "./types.ts";
 import { createWatchdogWarningMessage } from "./warning-format.ts";
 
 interface RegisterMainWatchdogOptions {
 	runtime?: MainWatchdogRuntime;
 	review?: WatchdogReviewFunction;
+	/** config.enableSlashCommands: false leaves out /subagents-watchdog. */
+	slashCommand?: boolean;
 }
 
 function sendSlashText(pi: ExtensionAPI, text: string): void {
-	pi.sendMessage({ customType: SLASH_TEXT_RESULT_TYPE, content: text, display: true });
+	pi.sendMessage({ customType: SLASH_TEXT_RESULT_TYPE, content: text, display: true, details: SLASH_TEXT_VIEW_ONLY_DETAILS });
 }
 
 function messageFromError(error: unknown): string {
@@ -63,16 +62,11 @@ function mainThinkingLine(snapshot: ReturnType<MainWatchdogRuntime["getSnapshot"
 }
 
 function mainModelLine(snapshot: ReturnType<MainWatchdogRuntime["getSnapshot"]>, ctx: ExtensionContext): string {
-	const fallbacks = fallbackLine(snapshot.config.main.fallbackModels);
 	if (snapshot.config.main.model) {
 		const source = snapshot.sessionModelOverride?.model ? "session override" : "configured";
-		return `Main model: ${splitKnownThinkingSuffix(snapshot.config.main.model).baseModel} (${source})${fallbacks}`;
+		return `Main model: ${splitKnownThinkingSuffix(snapshot.config.main.model).baseModel} (${source})`;
 	}
-	return `Main model: ${currentSessionModelLine(ctx)}${fallbacks}`;
-}
-
-function fallbackLine(models: string[] | undefined): string {
-	return models === undefined ? "" : ` · fallbacks ${models.length ? models.join(" → ") : "none"}`;
+	return `Main model: ${currentSessionModelLine(ctx)}`;
 }
 
 function childrenLine(snapshot: ReturnType<MainWatchdogRuntime["getSnapshot"]>): string {
@@ -85,12 +79,11 @@ function childrenLine(snapshot: ReturnType<MainWatchdogRuntime["getSnapshot"]>):
 			const bits = [agent];
 			if (override.enabled !== undefined) bits.push(boolLabel(override.enabled));
 			if (override.model) bits.push(splitKnownThinkingSuffix(override.model).baseModel);
-			if (override.fallbackModels !== undefined) bits.push(fallbackLine(override.fallbackModels));
 			if (override.thinking !== undefined) bits.push(`thinking ${override.thinking === false ? "off" : override.thinking}`);
 			return bits.join(" ");
 		}).join("; ")}`
 		: "";
-	return `Children: ${boolLabel(snapshot.config.enabled && children.enabled)} · model ${model}${fallbackLine(children.fallbackModels)} · thinking ${thinking}${overrideText}`;
+	return `Children: ${boolLabel(snapshot.config.enabled && children.enabled)} · model ${model} · thinking ${thinking}${overrideText}`;
 }
 
 function recommendationLine(snapshot: ReturnType<MainWatchdogRuntime["getSnapshot"]>, ctx: ExtensionContext): string {
@@ -155,7 +148,7 @@ export function buildWatchdogStatus(snapshot: ReturnType<MainWatchdogRuntime["ge
 		"- /subagents-watchdog model <provider/model[:thinking]>",
 		"- /subagents-watchdog model inherit",
 		"- /subagents-watchdog session model recommended",
-		"Agent action: subagent({ action: \"watchdog.configure\", model: \"recommended\", scope: \"session\" })",
+		"Agent action: subagent({ action: \"watchdog.configure\", model: \"recommended\", options: { scope: \"session\" } })",
 	);
 	return lines.join("\n");
 }
@@ -378,7 +371,7 @@ async function handleWatchdogCommand(
 
 export function registerMainWatchdog(pi: ExtensionAPI, options: RegisterMainWatchdogOptions = {}): MainWatchdogRuntime {
 	let currentContext: ExtensionContext | undefined;
-	let diffBaseline: WatchdogDiffBaseline | undefined;
+	let diffBaseline: Promise<WatchdogDiffBaseline | undefined> | undefined;
 	const rememberContext = (ctx: ExtensionContext) => {
 		currentContext = ctx;
 	};
@@ -391,24 +384,7 @@ export function registerMainWatchdog(pi: ExtensionAPI, options: RegisterMainWatc
 		displayClarification: (content) => pi.sendMessage({ customType: "subagent_watchdog_clarification", content, display: true }, { deliverAs: "steer", triggerTurn: true }),
 	});
 
-	pi.registerMessageRenderer<WatchdogWarningDetails>(SUBAGENT_WATCHDOG_WARNING_TYPE, (message, renderOptions, theme) => {
-		const details = message.details as WatchdogWarningDetails | undefined;
-		if (!details?.summary || !details.evidence || !details.recommendedAction) {
-			const content = typeof message.content === "string"
-				? message.content
-				: message.content.filter((entry) => entry.type === "text").map((entry) => entry.text).join("\n");
-			return new Text(content, 0, 0);
-		}
-		return renderWatchdogWarning(details, renderOptions, theme);
-	});
-	pi.registerEntryRenderer<WatchdogWarningDetails>(SUBAGENT_WATCHDOG_WARNING_TYPE, (entry, renderOptions, theme) => {
-		const details = entry.data as WatchdogWarningDetails | undefined;
-		return details?.summary && details.evidence && details.recommendedAction
-			? renderWatchdogWarning(details, renderOptions, theme)
-			: undefined;
-	});
-
-	pi.registerCommand("subagents-watchdog", {
+	if (options.slashCommand !== false) pi.registerCommand("subagents-watchdog", {
 		description: "Show or toggle the default-off subagent watchdog",
 		handler: (args, ctx) => {
 			rememberContext(ctx);
@@ -418,7 +394,7 @@ export function registerMainWatchdog(pi: ExtensionAPI, options: RegisterMainWatc
 
 	pi.on("session_start", (_event, ctx) => {
 		rememberContext(ctx);
-		diffBaseline = captureWatchdogDiffBaseline(ctx.cwd);
+		diffBaseline = startWatchdogDiffBaselineCapture(ctx.cwd);
 		runtime.bindSession(ctx);
 	});
 	pi.on("before_agent_start", (event, ctx) => {
@@ -429,7 +405,7 @@ export function registerMainWatchdog(pi: ExtensionAPI, options: RegisterMainWatc
 		rememberContext(ctx);
 		runtime.handleTurnEnd(event, ctx);
 	});
-	pi.on("input", (event) => { if (event.source !== "extension") runtime.handleUserInput(); });
+	pi.on("input", (event) => runtime.handleUserInput(event));
 	pi.on("model_select", () => runtime.handleModelChange());
 	pi.on("tool_result", (_event, ctx) => {
 		rememberContext(ctx);
@@ -441,7 +417,7 @@ export function registerMainWatchdog(pi: ExtensionAPI, options: RegisterMainWatc
 	});
 	pi.on("session_before_switch", () => runtime.reset("session switch", { clearReviewInputSignature: true, clearLspLedger: true, clearScope: true }));
 	pi.on("session_before_fork", () => runtime.reset("session fork", { clearReviewInputSignature: true, clearLspLedger: true, clearScope: true }));
-	pi.on("session_compact", () => runtime.reset("session compact", { clearScope: true }));
+	pi.on("session_compact", () => runtime.reset("session compact", { clearActivity: true }));
 	pi.on("session_shutdown", () => {
 		currentContext = undefined;
 		runtime.dispose();
